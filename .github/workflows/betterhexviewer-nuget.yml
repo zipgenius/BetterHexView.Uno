@@ -1,0 +1,87 @@
+name: BetterHexViewer.Uno NuGet
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'betterhexviewer-v*'
+    paths:
+      - '**/*.cs'
+      - '**/*.xaml'
+      - '**/*.csproj'
+      - 'README.md'
+      - 'LICENSE'
+      - 'Directory.*'
+      - 'global.json'
+      - '.github/workflows/betterhexviewer-nuget.yml'
+  pull_request:
+    paths:
+      - '**/*.cs'
+      - '**/*.xaml'
+      - '**/*.csproj'
+      - 'README.md'
+      - 'LICENSE'
+      - 'Directory.*'
+      - 'global.json'
+      - '.github/workflows/betterhexviewer-nuget.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          [xml]$project = Get-Content BetterHexViewer.Uno.csproj -Raw
+          $version = [string]$project.Project.PropertyGroup.Version
+          if ($env:REF_TYPE -eq 'tag' -and $env:RELEASE_TAG -ne "betterhexviewer-v$version") {
+            throw "The tag must be betterhexviewer-v$version to match the project version."
+          }
+      - name: Build control and demo
+        run: dotnet build BetterHexViewer.Uno.Demo/BetterHexViewer.Uno.Demo.csproj -c Release
+      - name: Verify control in Uno host
+        run: dotnet run --project BetterHexViewer.Uno.Demo -c Release --no-build -- --self-test
+      - name: Pack
+        run: dotnet pack BetterHexViewer.Uno.csproj -c Release --no-build -o artifacts/betterhexviewer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BetterHexViewer-Uno-NuGet
+          path: artifacts/betterhexviewer/*.nupkg
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/betterhexviewer-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: actions/download-artifact@v4
+        with:
+          name: BetterHexViewer-Uno-NuGet
+          path: packages
+      - name: Publish to nuget.org
+        shell: bash
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo 'Configure the NUGET_API_KEY repository secret before publishing.' >&2
+            exit 1
+          fi
+          dotnet nuget push 'packages/*.nupkg' --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate

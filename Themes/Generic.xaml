@@ -1,0 +1,57 @@
+<ResourceDictionary
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:BetterHexViewer.Uno"
+    xmlns:canvas="using:BetterHexViewer.Uno.Rendering">
+
+    <Style TargetType="local:BetterHexViewer">
+        <Setter Property="FontFamily" Value="Courier New"/>
+        <Setter Property="FontSize"   Value="13"/>
+        <Setter Property="HorizontalAlignment" Value="Stretch"/>
+        <Setter Property="VerticalAlignment"   Value="Stretch"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="local:BetterHexViewer">
+                    <!--
+                        Skia HexCanvas + tooltip overlay in a Grid.
+                        The Canvas layer (IsHitTestVisible=False) hosts the
+                        PART_TooltipBorder so it floats above everything
+                        without interfering with pointer events.
+                    -->
+                    <Grid>
+                        <canvas:HexCanvas x:Name="PART_Canvas"
+                                              HorizontalAlignment="Stretch"
+                                              VerticalAlignment="Stretch"
+                                              />
+
+                        <!-- Hover-highlight overlay: only this layer is invalidated on mouse-move,
+                             so the main canvas (bytes, ruler, ASCII) never flickers. -->
+                        <canvas:HexCanvas x:Name="PART_HoverCanvas"
+                                              HorizontalAlignment="Stretch"
+                                              VerticalAlignment="Stretch"
+
+                                              IsHitTestVisible="False"/>
+
+                        <Canvas IsHitTestVisible="False">
+                            <Border x:Name="PART_TooltipBorder"
+                                    Background="{ThemeResource ToolTipBackground}"
+                                    BorderBrush="{ThemeResource ToolTipBorderBrush}"
+                                    BorderThickness="1"
+                                    CornerRadius="3"
+                                    Padding="7,4"
+                                    Visibility="Collapsed"
+                                    IsHitTestVisible="False">
+                                <TextBlock x:Name="PART_TooltipText"
+                                           Foreground="{ThemeResource ToolTipForeground}"
+                                           FontFamily="Segoe UI"
+                                           FontSize="11"
+                                           TextWrapping="NoWrap"/>
+                            </Border>
+                        </Canvas>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+</ResourceDictionary>

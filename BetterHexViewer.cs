@@ -1,0 +1,2372 @@
+// BetterHexViewer.cs
+// Uno Platform Hex Viewer Control
+// Part of BetterHexViewer.Uno – by zipgenius.it
+// Port of WinUI3 package 1.2.1; rendering adapted for Uno Platform.
+
+using BetterHexViewer.Uno.Rendering;
+using Microsoft.UI;
+using Microsoft.UI.Text;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Shapes;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Numerics;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.Foundation;
+using Windows.UI;
+using Windows.UI.Text;
+
+namespace BetterHexViewer.Uno
+{
+    public enum OffsetFormat    { Hexadecimal, Decimal, Octal }
+    public enum ColumnGroupSize { One = 1, Two = 2, Four = 4, Eight = 8, Sixteen = 16 }
+
+    /// <summary>Result of a search operation.</summary>
+    public sealed class HexSearchResult : EventArgs
+    {
+        /// <summary>True when a match was found.</summary>
+        public bool Found        { get; }
+        /// <summary>Byte offset of the match start, or -1 when not found.</summary>
+        public long Offset       { get; }
+        /// <summary>Length of the match in bytes.</summary>
+        public long Length       { get; }
+        /// <summary>True when the search wrapped around the end/start of the data.</summary>
+        public bool Wrapped      { get; }
+
+        internal HexSearchResult(bool found, long offset, long length, bool wrapped)
+        { Found = found; Offset = offset; Length = length; Wrapped = wrapped; }
+
+        internal static readonly HexSearchResult NotFound =
+            new HexSearchResult(false, -1, 0, false);
+    }
+
+    /// <summary>
+    /// Describes the current selection state of a <see cref="BetterHexViewer"/>.
+    /// Unlike <see cref="HexSelectionChangedEventArgs"/>, <see cref="Data"/> has
+    /// no length cap — it always contains the full selected content.
+    /// </summary>
+    public sealed class HexSelection
+    {
+        /// <summary>Byte offset of the first selected byte, or -1 when there is no selection.</summary>
+        public long StartOffset { get; }
+
+        /// <summary>Number of selected bytes (0 when there is no selection).</summary>
+        public long Length { get; }
+
+        /// <summary>
+        /// Full copy of the selected bytes — no length limit.
+        /// Empty array when there is no selection.
+        /// </summary>
+        public byte[] Data { get; }
+
+        /// <summary>Whether any bytes are currently selected.</summary>
+        public bool HasSelection => StartOffset >= 0 && Length > 0;
+
+        internal HexSelection(long start, long length, byte[] data)
+        { StartOffset = start; Length = length; Data = data; }
+
+        internal static readonly HexSelection Empty =
+            new HexSelection(-1, 0, Array.Empty<byte>());
+    }
+
+    public sealed class HexSelectionChangedEventArgs : EventArgs
+    {
+        public long   StartOffset { get; }
+        public long   Length      { get; }
+        public byte[] Data        { get; }
+        internal HexSelectionChangedEventArgs(long start, long length, byte[] data)
+        { StartOffset = start; Length = length; Data = data; }
+    }
+
+    public sealed class HexHoverOffsetChangedEventArgs : EventArgs
+    {
+        public long Offset { get; }
+        public bool IsAsciiColumn { get; }
+        public bool IsHexColumn => Offset >= 0 && !IsAsciiColumn;
+        internal HexHoverOffsetChangedEventArgs(long offset, bool isAsciiColumn)
+        { Offset = offset; IsAsciiColumn = isAsciiColumn; }
+    }
+
+    /// <summary>
+    /// Uno Platform hex viewer (Skia HexCanvas) – zipgenius.it
+    /// </summary>
+    public sealed partial class BetterHexViewer : Control, IDisposable
+    {
+        // ─── Layout constants ─────────────────────────────────────────────
+        private const double RulerExtraHeight = 8;
+        private const double HexExtraGap      = 12;
+        private const double AsciiRightPad    = 12;
+        private const double ScrollBarWidth   = 16;
+        private const double InnerByteGap     = 3;
+        private const double SelPad           = 2;
+        private const int    MinBytesPerLine  = 1;
+
+        // ─── Skia canvas ─────────────────────────────────────────────────
+        private HexCanvas _canvas = null!;
+        /// <summary>
+        /// Transparent overlay canvas for hover highlights only.
+        /// Invalidated on mouse-move instead of the main canvas, so the
+        /// ruler, bytes and ASCII columns never flicker.
+        /// </summary>
+        private HexCanvas? _hoverCanvas;
+
+        // ─── Tooltip overlay (Border + TextBlock in XAML template) ───────
+        private Border    _tooltipBorder = null!;
+        private TextBlock _tooltipText   = null!;
+        private Microsoft.UI.Xaml.DispatcherTimer? _tooltipTimer;
+        private long   _tooltipByteIdx = -1;
+        private Point  _tooltipPt;
+
+        // ─── Scrollbar state ──────────────────────────────────────────────
+        private long   _sbTotalLines   = 0;
+        private long   _sbVisibleLines = 1;
+        private bool   _sbDragging     = false;
+        private double _sbDragStartY   = 0;
+        private long   _sbDragStartTop = 0;
+        private double _wheelAccum     = 0;
+        private Microsoft.UI.Xaml.DispatcherTimer? _sbRepeatTimer;
+        private int    _sbRepeatDir   = 0;
+        private bool   _sbRepeatFirst = true;
+        private double _sbBtnUpBottom = 0;
+        private double _sbBtnDnTop    = 0;
+        private double _sbThumbTop    = 0;
+        private double _sbThumbBot    = 0;
+
+        // ─── UI helpers ───────────────────────────────────────────────────
+        private MenuFlyout _contextMenu = null!;
+
+        // ─── Data ─────────────────────────────────────────────────────────
+        // Supports both byte[] (LoadBytes) and MemoryMappedFile (OpenFileAsync).
+        // All rendering and selection code accesses bytes via ByteAt(i) and DataLength.
+        private readonly object _dataGate = new();
+        private int _dataGeneration;
+        private byte[]?                       _bytes;          // set by LoadBytes()
+        private HexFileAccessor?              _mmva;           // mapped file or bounded stream
+        private long   _fileSize;
+
+        /// <summary>Number of bytes currently loaded (file size or array length).</summary>
+        private long DataLength => _fileSize;
+
+        /// <summary>Returns byte at position <paramref name="i"/> from either source.</summary>
+        private byte ByteAt(long i)
+        {
+            if (_bytes != null) return _bytes[i];
+            if (_mmva  != null) return _mmva.ReadByte(i);
+            return 0;
+        }
+
+        /// <summary>Disposes any open memory-mapped file and clears all data fields.</summary>
+        private void ReleaseData()
+        {
+            ClearSearch();
+            _dataGeneration++;
+            lock (_dataGate)
+            {
+                _mmva?.Dispose(); _mmva = null;
+                _bytes = null;
+                _fileSize = 0;
+            }
+            _hoverByte = -1;
+            _hoverCanvas?.Invalidate();
+            HideTooltip();
+            _sbRepeatTimer?.Stop();
+            _sbDragging = _mouseDown = false;
+        }
+        private long   _topLine;
+
+        // ─── Selection & hover ────────────────────────────────────────────
+        private long _selStart   = -1;
+        private long _selEnd     = -1;
+        private long _caretByte  = -1;
+        private long _hoverByte  = -1;   // byte under pointer (for hover highlight)
+        private bool _mouseDown;
+
+        // ─── Font metrics ─────────────────────────────────────────────────
+        private double _charWidth    = 8;
+        private double _lineHeight   = 16;
+        private int    _bytesPerLine = 16;
+
+        // ─── Cached layout ────────────────────────────────────────────────
+        private double _cachedHexStartX;
+        private double _cachedAsciiStartX;
+        private double _cachedDividerY;
+        private double _cachedAsciiColWidth;
+
+        // ─── Render throttle ──────────────────────────────────────────────
+        private bool _renderPending;
+        private bool _hoverRenderPending;
+
+        // ─── Skia text formats ───────────────────────────────────────────
+        private HexTextFormat? _txFmt;
+        private HexTextFormat? _txFmtBold;
+        private UIElement?        _rootContent;
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  DEPENDENCY PROPERTIES
+        // ═══════════════════════════════════════════════════════════════════
+
+        #region FontFamily (shadow – intercepts runtime changes)
+        public static new readonly DependencyProperty FontFamilyProperty =
+            DependencyProperty.Register(nameof(FontFamily), typeof(FontFamily),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    new FontFamily("Courier New"), OnFontPropertyChanged));
+        public new FontFamily FontFamily
+        {
+            get => (FontFamily)GetValue(FontFamilyProperty);
+            set => SetValue(FontFamilyProperty, value);
+        }
+        #endregion
+
+        #region FontSize (shadow – intercepts runtime changes)
+        public static new readonly DependencyProperty FontSizeProperty =
+            DependencyProperty.Register(nameof(FontSize), typeof(double),
+                typeof(BetterHexViewer), new PropertyMetadata(13.0, OnFontPropertyChanged));
+        public new double FontSize
+        {
+            get => (double)GetValue(FontSizeProperty);
+            set => SetValue(FontSizeProperty, Math.Max(6, value));
+        }
+        #endregion
+
+        #region FontWeight (shadow – intercepts runtime changes)
+        public static new readonly DependencyProperty FontWeightProperty =
+            DependencyProperty.Register(nameof(FontWeight), typeof(FontWeight),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    FontWeights.Normal, OnFontPropertyChanged));
+        public new FontWeight FontWeight
+        {
+            get => (FontWeight)GetValue(FontWeightProperty);
+            set => SetValue(FontWeightProperty, value);
+        }
+        #endregion
+
+        #region ColumnGroupSize
+        public static readonly DependencyProperty ColumnGroupSizeProperty =
+            DependencyProperty.Register(nameof(ColumnGroupSize), typeof(ColumnGroupSize),
+                typeof(BetterHexViewer), new PropertyMetadata(ColumnGroupSize.One, OnLayoutPropertyChanged));
+        public ColumnGroupSize ColumnGroupSize
+        {
+            get => (ColumnGroupSize)GetValue(ColumnGroupSizeProperty);
+            set => SetValue(ColumnGroupSizeProperty, value);
+        }
+        #endregion
+
+        #region OffsetFormat
+        public static readonly DependencyProperty OffsetFormatProperty =
+            DependencyProperty.Register(nameof(OffsetFormat), typeof(OffsetFormat),
+                typeof(BetterHexViewer), new PropertyMetadata(OffsetFormat.Hexadecimal, OnLayoutPropertyChanged));
+        public OffsetFormat OffsetFormat
+        {
+            get => (OffsetFormat)GetValue(OffsetFormatProperty);
+            set => SetValue(OffsetFormatProperty, value);
+        }
+        #endregion
+
+        #region BytesSpacing
+        public static readonly DependencyProperty BytesSpacingProperty =
+            DependencyProperty.Register(nameof(BytesSpacing), typeof(double),
+                typeof(BetterHexViewer), new PropertyMetadata(10.0, OnLayoutPropertyChanged));
+        public double BytesSpacing
+        {
+            get => (double)GetValue(BytesSpacingProperty);
+            set => SetValue(BytesSpacingProperty, Math.Max(0, value));
+        }
+        #endregion
+
+        #region ExtraLineGap
+        public static readonly DependencyProperty ExtraLineGapProperty =
+            DependencyProperty.Register(nameof(ExtraLineGap), typeof(double),
+                typeof(BetterHexViewer), new PropertyMetadata(4.0, OnRenderPropertyChanged));
+        public double ExtraLineGap
+        {
+            get => (double)GetValue(ExtraLineGapProperty);
+            set => SetValue(ExtraLineGapProperty, Math.Clamp(value, 0, 12));
+        }
+        #endregion
+
+        #region FullWidth
+        public static readonly DependencyProperty FullWidthProperty =
+            DependencyProperty.Register(nameof(FullWidth), typeof(bool),
+                typeof(BetterHexViewer), new PropertyMetadata(false, OnLayoutPropertyChanged));
+        public bool FullWidth
+        {
+            get => (bool)GetValue(FullWidthProperty);
+            set => SetValue(FullWidthProperty, value);
+        }
+        #endregion
+
+        #region SelectionBackground
+        public static readonly DependencyProperty SelectionBackgroundProperty =
+            DependencyProperty.Register(nameof(SelectionBackground), typeof(Brush),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    new SolidColorBrush(Color.FromArgb(255, 0, 120, 215)), OnRenderPropertyChanged));
+        public Brush SelectionBackground
+        {
+            get => (Brush)GetValue(SelectionBackgroundProperty);
+            set => SetValue(SelectionBackgroundProperty, value);
+        }
+        #endregion
+
+        #region SelectionForeground
+        public static readonly DependencyProperty SelectionForegroundProperty =
+            DependencyProperty.Register(nameof(SelectionForeground), typeof(Brush),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    new SolidColorBrush(Colors.White), OnRenderPropertyChanged));
+        public Brush SelectionForeground
+        {
+            get => (Brush)GetValue(SelectionForegroundProperty);
+            set => SetValue(SelectionForegroundProperty, value);
+        }
+        #endregion
+
+        #region DividerBrush
+        public static readonly DependencyProperty DividerBrushProperty =
+            DependencyProperty.Register(nameof(DividerBrush), typeof(Brush),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    new SolidColorBrush(Colors.Gray), OnRenderPropertyChanged));
+        public Brush DividerBrush
+        {
+            get => (Brush)GetValue(DividerBrushProperty);
+            set => SetValue(DividerBrushProperty, value);
+        }
+        #endregion
+
+        #region OffsetBackground
+        /// <summary>
+        /// Background colour of the offset column area.
+        /// When null, it is auto-derived as a darker shade of <see cref="Control.Background"/>.
+        /// </summary>
+        public static readonly DependencyProperty OffsetBackgroundProperty =
+            DependencyProperty.Register(nameof(OffsetBackground), typeof(Brush),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    new SolidColorBrush(Color.FromArgb(255, 242, 242, 242)), OnRenderPropertyChanged));
+        public Brush? OffsetBackground
+        {
+            get => (Brush?)GetValue(OffsetBackgroundProperty);
+            set => SetValue(OffsetBackgroundProperty, value);
+        }
+        #endregion
+
+        #region AsciiBackground
+        /// <summary>
+        /// Background colour of the ASCII panel area.
+        /// When null, defaults to the same value as <see cref="OffsetBackground"/>.
+        /// </summary>
+        public static readonly DependencyProperty AsciiBackgroundProperty =
+            DependencyProperty.Register(nameof(AsciiBackground), typeof(Brush),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    new SolidColorBrush(Color.FromArgb(255, 242, 242, 242)), OnRenderPropertyChanged));
+        public Brush? AsciiBackground
+        {
+            get => (Brush?)GetValue(AsciiBackgroundProperty);
+            set => SetValue(AsciiBackgroundProperty, value);
+        }
+        #endregion
+
+        #region OffsetForeground
+        public static readonly DependencyProperty OffsetForegroundProperty =
+            DependencyProperty.Register(nameof(OffsetForeground), typeof(Brush),
+                typeof(BetterHexViewer), new PropertyMetadata(
+                    new SolidColorBrush(Color.FromArgb(255, 0, 0, 139)), OnRenderPropertyChanged));
+        public Brush OffsetForeground
+        {
+            get => (Brush)GetValue(OffsetForegroundProperty);
+            set => SetValue(OffsetForegroundProperty, value);
+        }
+        #endregion
+
+        #region RulerForeground
+        public static readonly DependencyProperty RulerForegroundProperty =
+            DependencyProperty.Register(nameof(RulerForeground), typeof(Brush),
+                typeof(BetterHexViewer), new PropertyMetadata(null, OnRenderPropertyChanged));
+        /// <summary>
+        /// Colour of the ruler header labels (OFFSET, column numbers, ASCII).
+        /// When null the colour is derived automatically from the background.
+        /// </summary>
+        public Brush? RulerForeground
+        {
+            get => (Brush?)GetValue(RulerForegroundProperty);
+            set => SetValue(RulerForegroundProperty, value);
+        }
+        #endregion
+
+        #region TooltipOffsetLabel
+        public static readonly DependencyProperty TooltipOffsetLabelProperty =
+            DependencyProperty.Register(nameof(TooltipOffsetLabel), typeof(string),
+                typeof(BetterHexViewer), new PropertyMetadata("Offset"));
+        /// <summary>
+        /// Label shown before the offset value in the hover tooltip.
+        /// Default is <c>"Offset"</c>. Set to e.g. <c>"Position"</c> or a
+        /// localised string to customise the tooltip text.
+        /// </summary>
+        public string TooltipOffsetLabel
+        {
+            get => (string)GetValue(TooltipOffsetLabelProperty);
+            set => SetValue(TooltipOffsetLabelProperty, value);
+        }
+        #endregion
+
+        #region NoDataLoadedText
+        public static readonly DependencyProperty NoDataLoadedTextProperty =
+            DependencyProperty.Register(nameof(NoDataLoadedText), typeof(string),
+                typeof(BetterHexViewer), new PropertyMetadata("No data loaded.", OnRenderPropertyChanged));
+        /// <summary>
+        /// Message displayed in the viewer when no data is loaded.
+        /// Default is <c>"No data loaded."</c>. Set this to a localised or
+        /// application-specific string to customise the empty-state text.
+        /// </summary>
+        public string NoDataLoadedText
+        {
+            get => (string)GetValue(NoDataLoadedTextProperty);
+            set => SetValue(NoDataLoadedTextProperty, value);
+        }
+        #endregion
+
+        #region ShowAsciiPanel
+        public static readonly DependencyProperty ShowAsciiPanelProperty =
+            DependencyProperty.Register(nameof(ShowAsciiPanel), typeof(bool),
+                typeof(BetterHexViewer), new PropertyMetadata(true, OnLayoutPropertyChanged));
+        public bool ShowAsciiPanel
+        {
+            get => (bool)GetValue(ShowAsciiPanelProperty);
+            set => SetValue(ShowAsciiPanelProperty, value);
+        }
+        #endregion
+
+        #region AsciiEncoding
+        // Not a DependencyProperty because Encoding is not a WinRT type.
+        // Use a plain CLR property + manual invalidate.
+        private Encoding _asciiEncoding = Encoding.Latin1;
+
+        /// <summary>
+        /// Encoding used to decode bytes for the ASCII panel.
+        /// Default is ISO-8859-1 (Latin-1), which maps every byte 0x00–0xFF
+        /// to its Unicode code point – a safe universal fallback.
+        /// Set to e.g. <c>Encoding.GetEncoding(437)</c> for IBM CP437,
+        /// <c>Encoding.UTF8</c> for UTF-8, etc.
+        /// Call <see cref="System.Text.Encoding.RegisterProvider"/> with
+        /// <see cref="System.Text.CodePagesEncodingProvider.Instance"/> before
+        /// using code-page encodings like CP437 or CP1252.
+        /// </summary>
+        public Encoding AsciiEncoding
+        {
+            get => _asciiEncoding;
+            set
+            {
+                if (value == null || ReferenceEquals(value, _asciiEncoding)) return;
+                _asciiEncoding = value;
+                _canvas?.Invalidate();
+            }
+        }
+        #endregion
+
+        #region BytesPerLine (read-only)
+        public static readonly DependencyProperty BytesPerLineProperty =
+            DependencyProperty.Register(nameof(BytesPerLine), typeof(int),
+                typeof(BetterHexViewer), new PropertyMetadata(16));
+        public int BytesPerLine => (int)GetValue(BytesPerLineProperty);
+        private void SetBytesPerLine(int v) => SetValue(BytesPerLineProperty, v);
+        #endregion
+
+        #region FileSize (read-only)
+        public static readonly DependencyProperty FileSizeProperty =
+            DependencyProperty.Register(nameof(FileSize), typeof(long),
+                typeof(BetterHexViewer), new PropertyMetadata(0L));
+        public long FileSize => (long)GetValue(FileSizeProperty);
+        private void SetFileSize(long v) => SetValue(FileSizeProperty, v);
+        #endregion
+
+        #region Selection (read-only, no length limit)
+        /// <summary>
+        /// Returns the current selection as a <see cref="HexSelection"/> object.
+        /// <see cref="HexSelection.Data"/> contains the full selected bytes with
+        /// no length cap. Returns <see cref="HexSelection.Empty"/> when nothing
+        /// is selected or no data is loaded.
+        /// </summary>
+        public HexSelection Selection
+        {
+            get
+            {
+                if (_selStart < 0 || _selEnd < 0 || DataLength == 0)
+                    return HexSelection.Empty;
+                long s   = Math.Min(_selStart, _selEnd);
+                long e   = Math.Max(_selStart, _selEnd);
+                long len = e - s + 1;
+                var  data = new byte[checked((int)len)];
+                // Copy from whichever source is active
+                if (_bytes != null)
+                    Array.Copy(_bytes, s, data, 0, len);
+                else if (_mmva != null)
+                    _mmva.ReadArray(s, data, 0, (int)len);
+                return new HexSelection(s, len, data);
+            }
+        }
+        #endregion
+
+        public event EventHandler<HexSelectionChangedEventArgs>? SelectionChanged;
+        public event EventHandler<HexHoverOffsetChangedEventArgs>? HoverOffsetChanged;
+
+        // ── Search state ─────────────────────────────────────────────────
+        private byte[]?            _lastPattern;       // last searched byte pattern
+        private bool _lastIgnoreCase;
+        private long               _lastMatchOffset = -1;
+        private CancellationTokenSource? _searchCts;
+        private long _lastHoverEventOffset = long.MinValue;
+        private bool _lastHoverEventIsAscii;
+
+        /// <summary>
+        /// Raised when a search finds a match. Contains the match offset and length.
+        /// When no match is found the event is raised with <see cref="HexSearchResult.Found"/> = false.
+        /// </summary>
+        public event EventHandler<HexSearchResult>? SearchResultFound;
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  CONSTRUCTOR
+        // ═══════════════════════════════════════════════════════════════════
+
+        public BetterHexViewer()
+        {
+            DefaultStyleKey = typeof(BetterHexViewer);
+            // Unlock all system code pages (IBM437, CP1252, etc.)
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+            // Light-theme defaults — overridden by ApplyTheme() once OnApplyTemplate runs
+            Background = new SolidColorBrush(Color.FromArgb(255, 254, 254, 254));
+            Foreground = new SolidColorBrush(Color.FromArgb(255,  27,  27,  27));
+            // Allow keyboard focus via Tab and mouse click
+            IsTabStop       = true;
+            TabNavigation   = KeyboardNavigationMode.Once;
+            GotFocus += (_, _) => _hasFocus = true;
+            LostFocus += (_, _) => _hasFocus = false;
+            AddHandler(KeyDownEvent, (KeyEventHandler)OnViewerKeyDown, true);
+            ActualThemeChanged += (_, _) => { ApplyTheme(); ScheduleRender(); };
+            PointerWheelChanged += OnViewerPointerWheelChanged;
+            RegisterPropertyChangedCallback(BackgroundProperty, (_, _) => ScheduleRender());
+            RegisterPropertyChangedCallback(ForegroundProperty, (_, _) => ScheduleRender());
+            // Release memory-mapped file when the control is unloaded from the visual tree
+            Unloaded += (_, _) =>
+            {
+                Clear();
+                DetachRoot();
+            };
+            // Observe clicks elsewhere to clear pointer focus. Keyboard input is
+            // handled by this control so a window with multiple viewers stays isolated.
+            Loaded += (_, _) =>
+            {
+                DetachRoot();
+                _rootContent = XamlRoot?.Content as UIElement;
+                if (_rootContent != null)
+                {
+                    _rootContent.AddHandler(PointerPressedEvent,(PointerEventHandler)OnRootPointerPressed, true);
+                    System.Diagnostics.Debug.WriteLine("[BHV] XamlRoot.Content hooked OK");
+                }
+                else
+                    System.Diagnostics.Debug.WriteLine("[BHV] WARNING: XamlRoot.Content not found");
+            };
+        }
+
+        /// <summary>
+        /// Releases the memory-mapped file handle (if any) opened by
+        /// <see cref="OpenFileAsync"/>. Call this when the control is no longer needed.
+        /// </summary>
+        public new void Dispose()
+        {
+            Clear();
+            InvalidateTxFormats();
+            DetachTemplate();
+            DetachRoot();
+            base.Dispose();
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  TEMPLATE
+        // ═══════════════════════════════════════════════════════════════════
+
+        protected override void OnApplyTemplate()
+        {
+            DetachTemplate();
+            base.OnApplyTemplate();
+
+            _canvas = (HexCanvas)GetTemplateChild("PART_Canvas");
+            _hoverCanvas = GetTemplateChild("PART_HoverCanvas") as HexCanvas;
+            _tooltipBorder = (Border)GetTemplateChild("PART_TooltipBorder");
+            _tooltipText   = (TextBlock)GetTemplateChild("PART_TooltipText");
+
+            _canvas.Draw        += OnCanvasDraw;
+            _canvas.SizeChanged += OnCanvasSizeChanged;
+
+            if (_hoverCanvas != null)
+                _hoverCanvas.Draw += OnHoverCanvasDraw;
+
+            _canvas.PointerPressed  += OnPointerPressed;
+            _canvas.PointerMoved    += OnPointerMoved;
+            _canvas.PointerMoved    += OnPointerHover;
+            _canvas.PointerReleased += OnPointerReleased;
+            _canvas.RightTapped     += OnRightTapped;
+            _canvas.PointerExited   += OnPointerExited;
+            _canvas.PointerPressed  += OnSbPointerPressed;
+            _canvas.PointerMoved    += OnSbPointerMoved;
+            _canvas.PointerReleased += OnSbPointerReleased;
+
+
+
+
+
+
+            BuildContextMenu();
+            MeasureFont();
+            ApplyTheme();
+            UpdateBytesPerLine();
+            UpdateScrollBar();
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  PUBLIC API
+        // ═══════════════════════════════════════════════════════════════════
+
+        public async Task OpenFileAsync(string filePath)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(filePath);
+            var size = new FileInfo(filePath).Length;
+            Clear();
+            int generation = _dataGeneration;
+            if (size == 0) return;
+
+            var mapping = await Task.Run(() => HexFileAccessor.Open(filePath));
+            // A later load, Clear or Dispose takes precedence over a pending open.
+            if (generation != _dataGeneration)
+            {
+                mapping.Dispose();
+                return;
+            }
+            _mmva = mapping;
+            _fileSize = size;
+            SetFileSize(size);
+            UpdateBytesPerLine(); UpdateScrollBar(); ScheduleRender(); FireSelectionChanged();
+        }
+
+        public void LoadBytes(byte[] data)
+        {
+            ReleaseData();
+            _bytes    = data ?? Array.Empty<byte>();
+            _fileSize = _bytes.Length;
+            SetFileSize(_fileSize);
+            _selStart = -1; _selEnd = -1; _caretByte = -1; _topLine = 0;
+            UpdateBytesPerLine(); UpdateScrollBar(); ScheduleRender(); FireSelectionChanged();
+        }
+
+        public void Clear()
+        {
+            ReleaseData();
+            SetFileSize(0L);
+            _selStart = -1; _selEnd = -1; _caretByte = -1; _topLine = 0;
+            UpdateScrollBar(); ScheduleRender(); FireSelectionChanged();
+        }
+
+        public void CopySelectionAsHex()
+        {
+            if (!HasSelection()) return;
+            long s = Math.Min(_selStart, _selEnd), e = Math.Max(_selStart, _selEnd);
+            var parts = new List<string>();
+            for (long i = s; i <= e && i < DataLength; i++)
+                parts.Add(ByteAt(i).ToString("X2"));
+            SetClipboard(string.Join(" ", parts));
+        }
+
+        public void CopySelectionAsAscii()
+        {
+            if (!HasSelection()) return;
+            long s = Math.Min(_selStart, _selEnd), e = Math.Max(_selStart, _selEnd);
+            var sb = new System.Text.StringBuilder();
+            for (long i = s; i <= e && i < DataLength; i++)
+                sb.Append(ByteToAsciiChar(ByteAt(i)));
+            SetClipboard(sb.ToString());
+        }
+
+        public void ScrollToOffset(long offset)
+        {
+            if (DataLength == 0 || _bytesPerLine == 0) return;
+            long maxTop = Math.Max(0L, _sbTotalLines - _sbVisibleLines);
+            _topLine    = Math.Clamp(offset / _bytesPerLine, 0L, maxTop);
+            ScheduleRender();
+        }
+
+        /// <summary>
+        /// Programmatically selects <paramref name="length"/> bytes starting at
+        /// <paramref name="startOffset"/> and scrolls the view to show the selection.
+        /// </summary>
+        /// <param name="startOffset">Zero-based byte offset of the first selected byte.</param>
+        /// <param name="length">Number of bytes to select. Clamped to the available data.</param>
+        public void SelectRange(long startOffset, long length)
+        {
+            if (DataLength == 0) return;
+            startOffset = Math.Clamp(startOffset, 0, DataLength - 1);
+            length      = Math.Clamp(length, 1, DataLength - startOffset);
+            _selStart   = startOffset;
+            _selEnd     = startOffset + length - 1;
+            _caretByte  = _selEnd;
+            ScrollToOffset(startOffset);
+            ScheduleRender();
+            FireSelectionChanged();
+        }
+
+        /// <summary>
+        /// Programmatically selects bytes from <paramref name="startOffset"/> to
+        /// <paramref name="endOffset"/> (both inclusive) and scrolls the view to
+        /// show the start of the selection. The two offsets can be passed in any order.
+        /// </summary>
+        /// <param name="startOffset">Offset of one end of the selection.</param>
+        /// <param name="endOffset">Offset of the other end of the selection.</param>
+        public void SelectFromTo(long startOffset, long endOffset)
+        {
+            if (DataLength == 0) return;
+            long s = Math.Clamp(Math.Min(startOffset, endOffset), 0, DataLength - 1);
+            long e = Math.Clamp(Math.Max(startOffset, endOffset), 0, DataLength - 1);
+            _selStart  = s;
+            _selEnd    = e;
+            _caretByte = e;
+            ScrollToOffset(s);
+            ScheduleRender();
+            FireSelectionChanged();
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  SEARCH
+        // ═══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Searches forward for <paramref name="pattern"/> starting after the
+        /// current selection (or from the beginning when nothing is selected).
+        /// Wraps around when reaching end of data.
+        /// </summary>
+        public Task<HexSearchResult> SearchAsync(byte[] pattern)
+            => SearchCoreAsync(pattern, forward: true);
+
+        /// <summary>
+        /// Converts <paramref name="text"/> to bytes using
+        /// <paramref name="encoding"/> (or <see cref="AsciiEncoding"/> when null)
+        /// and searches forward. Wraps around when reaching end of data.
+        /// </summary>
+        public Task<HexSearchResult> SearchAsync(string text, Encoding? encoding = null,
+                                          bool ignoreCase = false)
+        {
+            var enc = encoding ?? _asciiEncoding;
+            var pattern = NormalizePattern(enc.GetBytes(text), ignoreCase);
+            _lastIgnoreCase = ignoreCase;
+            return SearchCoreAsync(pattern, forward: true, ignoreCase: ignoreCase);
+        }
+
+        /// <summary>Repeats the last search forward.</summary>
+        public Task<HexSearchResult> SearchNextAsync()
+        {
+            if (_lastPattern == null || _lastPattern.Length == 0)
+                return Task.FromResult(HexSearchResult.NotFound);
+            return SearchCoreAsync(_lastPattern, forward: true,
+                                   fromAfterLast: true, ignoreCase: _lastIgnoreCase);
+        }
+
+        /// <summary>Repeats the last search backward.</summary>
+        public Task<HexSearchResult> SearchPreviousAsync()
+        {
+            if (_lastPattern == null || _lastPattern.Length == 0)
+                return Task.FromResult(HexSearchResult.NotFound);
+            return SearchCoreAsync(_lastPattern, forward: false,
+                                   fromAfterLast: true, ignoreCase: _lastIgnoreCase);
+        }
+
+        /// <summary>Clears the stored search pattern and search highlight.</summary>
+        public void ClearSearch()
+        {
+            _searchCts?.Cancel();
+            _searchCts?.Dispose();
+            _searchCts = null;
+            _lastIgnoreCase = false;
+            _lastPattern     = null;
+            _lastMatchOffset = -1;
+        }
+
+        /// <summary>
+        /// Returns the byte offsets of every occurrence of <paramref name="pattern"/>
+        /// in the loaded data. The search runs on a background thread and can be
+        /// cancelled by loading new data or calling <see cref="Clear"/>.
+        /// Returns an empty list when no data is loaded or the pattern is empty.
+        /// </summary>
+        public Task<IReadOnlyList<long>> FindAllAsync(byte[] pattern)
+            => FindAllCoreAsync(pattern);
+
+        /// <summary>
+        /// Converts <paramref name="text"/> to bytes using
+        /// <paramref name="encoding"/> (or <see cref="AsciiEncoding"/> when null)
+        /// and returns the offset of every occurrence in the loaded data.
+        /// When <paramref name="ignoreCase"/> is true the comparison is
+        /// case-insensitive for ASCII letters (A–Z / a–z).
+        /// </summary>
+        public Task<IReadOnlyList<long>> FindAllAsync(string text, Encoding? encoding = null,
+                                               bool ignoreCase = false)
+        {
+            var enc = encoding ?? _asciiEncoding;
+            var pattern = NormalizePattern(enc.GetBytes(text), ignoreCase);
+            return FindAllCoreAsync(pattern, ignoreCase: ignoreCase);
+        }
+
+        // Size of each read buffer for chunked MMF search. 4 MB gives a good balance
+        // between memory pressure and amortising ReadArray() call overhead.
+        private const int SearchReadChunk = 4 * 1024 * 1024;
+
+        /// <summary>
+        /// When <paramref name="ignoreCase"/> is true, returns a copy of
+        /// <paramref name="pattern"/> with all ASCII uppercase bytes (0x41–0x5A)
+        /// replaced by their lowercase equivalents (0x61–0x7A).
+        /// Returns the original array unchanged when false.
+        /// </summary>
+        private static byte[] NormalizePattern(byte[] pattern, bool ignoreCase)
+        {
+            if (!ignoreCase) return pattern;
+            var result = new byte[pattern.Length];
+            for (int i = 0; i < pattern.Length; i++)
+                result[i] = ToLowerAscii(pattern[i]);
+            return result;
+        }
+
+        private static byte ToLowerAscii(byte b)
+            => (b >= 0x41 && b <= 0x5A) ? (byte)(b | 0x20) : b;
+
+        private static byte ToLowerAscii(byte b, bool apply)
+            => apply ? ToLowerAscii(b) : b;
+
+        private async Task<IReadOnlyList<long>> FindAllCoreAsync(
+            byte[] pattern, bool ignoreCase = false)
+        {
+            if (DataLength == 0 || pattern.Length == 0)
+                return Array.Empty<long>();
+
+            _searchCts?.Cancel();
+            _searchCts?.Dispose();
+            _searchCts = new CancellationTokenSource();
+            var ct = _searchCts.Token;
+
+            pattern = (byte[])pattern.Clone();
+            _lastPattern = pattern;
+            _lastIgnoreCase = ignoreCase;
+
+            var results = await Task.Run(() =>
+            {
+                lock (_dataGate)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    byte[]? bytes = _bytes;
+                    HexFileAccessor? mmva = _mmva;
+                    int  m = pattern.Length;
+                    long n = DataLength;
+                    if (m > n) return new List<long>();
+
+                    // ── BMH bad-character skip table ──────────────────────────────
+                    var skip = new int[256];
+                    for (int i = 0; i < 256; i++) skip[i] = m;
+                    for (int i = 0; i < m - 1; i++) skip[pattern[i]] = m - 1 - i;
+
+                    // ── Fast path: in-memory byte array ───────────────────────────
+                    // The array is already pinned in managed heap, so direct indexing
+                    // is the fastest possible access.
+                    if (bytes != null)
+                    {
+                        var list = new List<long>();
+                        long pos = 0;
+                        while (pos <= n - m)
+                        {
+                            if (ct.IsCancellationRequested) return list;
+                            int j = m - 1;
+                            while (j >= 0 && pattern[j] == ToLowerAscii(bytes[pos + j], ignoreCase)) j--;
+                            if (j < 0) { list.Add(pos); pos += m; }
+                            else       { pos += skip[ToLowerAscii(bytes[pos + m - 1], ignoreCase)]; }
+                        }
+                        return list;
+                    }
+
+                    // ── MMF path: parallel chunked search ─────────────────────────
+                    // Per-byte ReadByte() on a MemoryMappedViewAccessor has very high
+                    // managed/native overhead.  Instead we bulk-read large slices with
+                    // ReadArray<byte>(), which amortises that cost to ~1 call per 4 MB.
+                    //
+                    // The file is divided into (processorCount) equal segments.  Each
+                    // segment is searched independently on a thread-pool thread.
+                    // Matches that straddle a segment boundary are found by extending
+                    // every segment's read window by (m-1) bytes into the next one.
+                    if (mmva == null) return new List<long>();
+
+                    int    cores    = Math.Max(1, Environment.ProcessorCount);
+                    int    overlap  = m - 1;
+                    // Keep each segment at SearchReadChunk bytes so per-thread allocation
+                    // stays at ~4 MB regardless of file size.  Parallelism comes from the
+                    // thread pool distributing the (potentially thousands of) segments.
+                    long   segLen   = SearchReadChunk;
+
+                    // Build the segment list
+                    var segments = new List<(long start, long end)>();
+                    for (long s = 0; s < n; s += segLen)
+                    {
+                        long end = Math.Min(s + segLen + overlap, n);
+                        segments.Add((s, end));
+                    }
+
+                    // Search each segment in parallel, collecting results per segment
+                    var segResults = new List<long>[segments.Count];
+                    System.Threading.Tasks.Parallel.For(0, segments.Count,
+                        new System.Threading.Tasks.ParallelOptions
+                        {
+                            CancellationToken      = ct,
+                            MaxDegreeOfParallelism = cores
+                        },
+                        segIdx =>
+                        {
+                            (long segStart, long segEnd) = segments[segIdx];
+                            int segN = (int)(segEnd - segStart);   // <= SearchReadChunk + overlap
+
+                            // Per-thread buffer — heap-allocated once per segment (~4 MB).
+                            byte[] buf = new byte[segN];
+                            mmva.ReadArray(segStart, buf, 0, segN);
+
+                            var local = new List<long>();
+                            int pos   = 0;
+                            int limit = segN - m;
+                            while (pos <= limit)
+                            {
+                                if (ct.IsCancellationRequested) return;
+                                int j = m - 1;
+                                while (j >= 0 && pattern[j] == ToLowerAscii(buf[pos + j], ignoreCase)) j--;
+                                if (j < 0)
+                                {
+                                    // Only record matches whose absolute offset falls within
+                                    // this segment's "owned" range (i.e. not in the overlap
+                                    // tail that the next segment will also scan).
+                                    long absPos = segStart + pos;
+                                    if (absPos < segStart + segLen || segIdx == segments.Count - 1)
+                                        local.Add(absPos);
+                                    pos += m;
+                                }
+                                else
+                                {
+                                    pos += skip[ToLowerAscii(buf[pos + m - 1], ignoreCase)];
+                                }
+                            }
+                            segResults[segIdx] = local;
+                        });
+
+                    if (ct.IsCancellationRequested) return new List<long>();
+
+                    // Merge segment results in order (they are already individually sorted).
+                    int totalCount = 0;
+                    foreach (var sr in segResults) if (sr != null) totalCount += sr.Count;
+                    var merged = new List<long>(totalCount);
+                    foreach (var sr in segResults) if (sr != null) merged.AddRange(sr);
+                    return merged;
+                }
+            }, ct).ConfigureAwait(false);
+
+            return ct.IsCancellationRequested
+                ? Array.Empty<long>()
+                : (IReadOnlyList<long>)results;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  KEYBOARD NAVIGATION
+        // ═══════════════════════════════════════════════════════════════════
+
+        private bool _hasFocus; // true after click inside this control, false after click elsewhere
+
+        /// <summary>
+        /// Handles keyboard navigation while this control has focus.
+        /// </summary>
+        private void OnViewerKeyDown(object sender, KeyRoutedEventArgs e)
+        {
+            if (!_hasFocus || DataLength == 0) return;
+            System.Diagnostics.Debug.WriteLine($"[BHV] OnViewerKeyDown key={e.Key}");
+
+            bool ctrl  = Microsoft.UI.Input.InputKeyboardSource
+                             .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Control)
+                             .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+            bool shift = Microsoft.UI.Input.InputKeyboardSource
+                             .GetKeyStateForCurrentThread(Windows.System.VirtualKey.Shift)
+                             .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
+
+            if (_caretByte < 0) _caretByte = 0;
+            long next    = _caretByte;
+            bool handled = true;
+
+            switch (e.Key)
+            {
+                case Windows.System.VirtualKey.Right:
+                    next = ctrl
+                        ? Math.Min(DataLength - 1, next + _bytesPerLine - (next % _bytesPerLine))
+                        : Math.Min(DataLength - 1, next + 1);
+                    break;
+                case Windows.System.VirtualKey.Left:
+                    next = ctrl ? next - (next % _bytesPerLine) : Math.Max(0, next - 1);
+                    break;
+                case Windows.System.VirtualKey.Down:
+                    next = ctrl
+                        ? Math.Min(DataLength - 1, next + _sbVisibleLines * _bytesPerLine)
+                        : Math.Min(DataLength - 1, next + _bytesPerLine);
+                    break;
+                case Windows.System.VirtualKey.Up:
+                    next = ctrl
+                        ? Math.Max(0, next - _sbVisibleLines * _bytesPerLine)
+                        : Math.Max(0, next - _bytesPerLine);
+                    break;
+                case Windows.System.VirtualKey.Home:
+                    next = ctrl ? 0 : next - (next % _bytesPerLine);
+                    break;
+                case Windows.System.VirtualKey.End:
+                    next = ctrl
+                        ? DataLength - 1
+                        : Math.Min(DataLength - 1, next - (next % _bytesPerLine) + _bytesPerLine - 1);
+                    break;
+                case Windows.System.VirtualKey.PageDown:
+                    next = Math.Min(DataLength - 1, next + _sbVisibleLines * _bytesPerLine);
+                    break;
+                case Windows.System.VirtualKey.PageUp:
+                    next = Math.Max(0, next - _sbVisibleLines * _bytesPerLine);
+                    break;
+                case Windows.System.VirtualKey.A when ctrl:
+                    _selStart = 0; _selEnd = DataLength - 1; _caretByte = _selEnd;
+                    EnsureCaretVisible();
+                    ScheduleRender(); FireSelectionChanged();
+                    e.Handled = true;
+                    return;
+                default:
+                    handled = false;
+                    break;
+            }
+
+            if (!handled) return;
+
+            if (shift)
+            {
+                if (!HasSelection()) _selStart = _caretByte;
+                _selEnd = next; _caretByte = next;
+            }
+            else
+            {
+                _selStart = next; _selEnd = next; _caretByte = next;
+            }
+
+            EnsureCaretVisible();
+            ScheduleRender();
+            FireSelectionChanged();
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// Clears <see cref="_hasFocus"/> when the user clicks anywhere outside
+        /// this control, so keyboard events are no longer intercepted.
+        /// </summary>
+        private void OnRootPointerPressed(object sender, PointerRoutedEventArgs e)
+        {
+            // Check if the press landed inside our canvas bounds.
+            var pt = e.GetCurrentPoint(_canvas);
+            bool inside = pt.Position.X >= 0 && pt.Position.X <= _canvas.ActualWidth &&
+                          pt.Position.Y >= 0 && pt.Position.Y <= _canvas.ActualHeight;
+            if (!inside)
+            {
+                _hasFocus = false;
+                System.Diagnostics.Debug.WriteLine("[BHV] OnRootPointerPressed outside → _hasFocus=false");
+            }
+        }
+
+        /// <summary>Scrolls the view so that <see cref="_caretByte"/> is visible.</summary>
+        private void EnsureCaretVisible()
+        {
+            if (_bytesPerLine == 0) return;
+            long caretRow = _caretByte / _bytesPerLine;
+            if (caretRow < _topLine)
+                _topLine = caretRow;
+            else if (caretRow >= _topLine + _sbVisibleLines)
+                _topLine = caretRow - _sbVisibleLines + 1;
+        }
+        private async Task<HexSearchResult> SearchCoreAsync(
+            byte[] pattern, bool forward, bool fromAfterLast = false,
+            bool ignoreCase = false)
+        {
+            if (DataLength == 0 || pattern.Length == 0)
+                return HexSearchResult.NotFound;
+
+            // Cancel any in-flight search
+            _searchCts?.Cancel();
+            _searchCts?.Dispose();
+            _searchCts = new CancellationTokenSource();
+            var ct = _searchCts.Token;
+
+            pattern = (byte[])pattern.Clone();
+            _lastPattern = pattern;
+            _lastIgnoreCase = ignoreCase;
+
+            // Determine start position
+            long startPos;
+            bool initiallyWrapped = false;
+            if (forward)
+            {
+                if (fromAfterLast && _lastMatchOffset >= 0)
+                    startPos = _lastMatchOffset + 1;
+                else if (_selEnd >= 0)
+                    startPos = Math.Max(_selStart, _selEnd) + 1;
+                else
+                    startPos = 0;
+                if (startPos >= DataLength) { startPos = 0; initiallyWrapped = true; }
+            }
+            else
+            {
+                if (fromAfterLast && _lastMatchOffset >= 0)
+                    startPos = _lastMatchOffset - 1;
+                else if (_selStart >= 0)
+                    startPos = Math.Min(_selStart, _selEnd) - 1;
+                else
+                    startPos = DataLength - 1;
+                if (startPos < 0) { startPos = DataLength - 1; initiallyWrapped = true; }
+            }
+
+            long matchOffset = await Task.Run(() => SearchWorker(pattern, startPos, forward, ct, ignoreCase), ct);
+
+            if (ct.IsCancellationRequested) return HexSearchResult.NotFound;
+
+            bool wrapped = initiallyWrapped;
+
+            // Wrap-around
+            if (matchOffset < 0)
+            {
+                wrapped = true;
+                matchOffset = await Task.Run(() => SearchWorker(pattern, forward ? 0 : DataLength - 1, forward, ct, ignoreCase), ct);
+            }
+
+            if (ct.IsCancellationRequested) return HexSearchResult.NotFound;
+
+            HexSearchResult result;
+            if (matchOffset < 0)
+            {
+                result = HexSearchResult.NotFound;
+            }
+            else
+            {
+                _lastMatchOffset = matchOffset;
+                result = new HexSearchResult(true, matchOffset, pattern.Length, wrapped);
+
+                // The await resumes on the caller's UI context.
+                _selStart  = matchOffset;
+                _selEnd    = matchOffset + pattern.Length - 1;
+                _caretByte = _selEnd;
+                ScrollToOffset(matchOffset);
+                ScheduleRender();
+                FireSelectionChanged();
+            }
+
+            // Raise event on UI thread
+            SearchResultFound?.Invoke(this, result);
+
+            return result;
+        }
+
+        // ── Boyer-Moore-Horspool forward ──────────────────────────────────
+        private long BmhForward(byte[] pat, long start, CancellationToken ct,
+                                 bool ignoreCase = false)
+        {
+            int  m = pat.Length;
+            long n = DataLength;
+            if (m > n) return -1;
+
+            // Bad-character skip table (pat is already normalised by NormalizePattern)
+            var skip = new int[256];
+            for (int i = 0; i < 256; i++) skip[i] = m;
+            for (int i = 0; i < m - 1; i++) skip[pat[i]] = m - 1 - i;
+
+            // ── Fast path: in-memory byte array ───────────────────────────────
+            if (_bytes != null)
+            {
+                long i2 = start;
+                while (i2 <= n - m)
+                {
+                    if (ct.IsCancellationRequested) return -1;
+                    int j = m - 1;
+                    while (j >= 0 && pat[j] == ToLowerAscii(_bytes[i2 + j], ignoreCase)) j--;
+                    if (j < 0) return i2;
+                    i2 += skip[ToLowerAscii(_bytes[i2 + m - 1], ignoreCase)];
+                }
+                return -1;
+            }
+
+            // ── MMF path: chunked bulk reads ──────────────────────────────────
+            // Avoids the heavy per-byte ReadByte() overhead on the accessor.
+            if (_mmva == null) return -1;
+
+            int  overlap  = m - 1;
+            int  bufSize  = SearchReadChunk + overlap;
+            byte[] buf    = new byte[bufSize];
+            long filePos  = start;
+
+            while (filePos <= n - m)
+            {
+                if (ct.IsCancellationRequested) return -1;
+
+                long remaining = n - filePos;
+                int  toRead    = (int)Math.Min(bufSize, remaining);
+                _mmva.ReadArray(filePos, buf, 0, toRead);
+
+                // Use int for the in-buffer position; bufSize is always <= int.MaxValue.
+                int bLimit = toRead - m;
+                int pos    = 0;
+                while (pos <= bLimit)
+                {
+                    int j = m - 1;
+                    while (j >= 0 && pat[j] == ToLowerAscii(buf[pos + j], ignoreCase)) j--;
+                    if (j < 0) return filePos + pos;
+                    pos += skip[ToLowerAscii(buf[pos + m - 1], ignoreCase)];
+                }
+
+                long advance = toRead - overlap;
+                if (advance <= 0) break;
+                filePos += advance;
+            }
+            return -1;
+        }
+
+        // ── Boyer-Moore-Horspool backward ─────────────────────────────────
+        private long BmhBackward(byte[] pat, long start, CancellationToken ct,
+                                  bool ignoreCase = false)
+        {
+            int  m = pat.Length;
+            long n = DataLength;
+            if (m > n) return -1;
+
+            // Bad-character skip table (reversed pattern, matching from the left;
+            // pat is already normalised by NormalizePattern)
+            var skip = new int[256];
+            for (int i = 0; i < 256; i++) skip[i] = m;
+            for (int i = m - 1; i > 0; i--) skip[pat[i]] = i;
+
+            long scanEnd = Math.Min(start, n - m);   // highest candidate start offset
+
+            // ── Fast path: in-memory byte array ───────────────────────────────
+            if (_bytes != null)
+            {
+                long i2 = scanEnd;
+                while (i2 >= 0)
+                {
+                    if (ct.IsCancellationRequested) return -1;
+                    int j = 0;
+                    while (j < m && pat[j] == ToLowerAscii(_bytes[i2 + j], ignoreCase)) j++;
+                    if (j == m) return i2;
+                    i2 -= skip[ToLowerAscii(_bytes[i2], ignoreCase)];
+                }
+                return -1;
+            }
+
+            // ── MMF path: chunked bulk reads (right-to-left) ──────────────────
+            // We walk backwards through the file in chunks of SearchReadChunk.
+            // Each chunk is read with an (m-1) byte prefix from the previous
+            // (i.e. right-hand) chunk so cross-boundary candidates are covered.
+            if (_mmva == null) return -1;
+
+            int    overlap  = m - 1;
+            long   chunkPos = scanEnd;           // last candidate start in current chunk
+            byte[] buf      = Array.Empty<byte>();
+
+            while (chunkPos >= 0)
+            {
+                if (ct.IsCancellationRequested) return -1;
+
+                // Window: read from max(0, chunkPos - SearchReadChunk + 1)
+                // through (chunkPos + m - 1) inclusive, capped at n.
+                long winStart = Math.Max(0, chunkPos - SearchReadChunk + 1);
+                long winEnd   = Math.Min(n, chunkPos + m);   // exclusive
+                int  toRead   = (int)(winEnd - winStart);
+
+                if (buf.Length < toRead) buf = new byte[toRead];
+                _mmva.ReadArray(winStart, buf, 0, toRead);
+
+                // Scan backwards within this buffer.
+                // Use int for the in-buffer position; toRead is always <= int.MaxValue.
+                int localEnd = (int)(chunkPos - winStart);   // offset inside buf
+                int i2       = localEnd;
+                while (i2 >= 0)
+                {
+                    int j = 0;
+                    while (j < m && pat[j] == ToLowerAscii(buf[i2 + j], ignoreCase)) j++;
+                    if (j == m) return winStart + i2;
+                    i2 -= skip[ToLowerAscii(buf[i2], ignoreCase)];
+                }
+
+                // Move the window left; stop if we've already included offset 0
+                if (winStart == 0) break;
+                chunkPos = winStart + overlap - 1;
+            }
+            return -1;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  PROPERTY CHANGE CALLBACKS
+        // ═══════════════════════════════════════════════════════════════════
+
+        private static void OnFontPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var v = (BetterHexViewer)d;
+            v.InvalidateTxFormats();
+            v.MeasureFont();
+            v.UpdateBytesPerLine(); v.UpdateScrollBar(); v.ScheduleRender();
+        }
+
+        private static void OnLayoutPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var v = (BetterHexViewer)d;
+            v.InvalidateTxFormats();
+            v.UpdateBytesPerLine(); v.UpdateScrollBar(); v.ScheduleRender();
+        }
+
+        private static void OnRenderPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+            {
+            var viewer = (BetterHexViewer)d;
+            viewer.UpdateScrollBar();
+            viewer.ScheduleRender();
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  CONTEXT MENU
+        // ═══════════════════════════════════════════════════════════════════
+
+        private void BuildContextMenu()
+        {
+            _contextMenu = new MenuFlyout();
+            var copyHex   = new MenuFlyoutItem { Text = "Copy bytes (hex)" };
+            var copyAscii = new MenuFlyoutItem { Text = "Copy as ASCII" };
+            copyHex.Click   += (_, _) => CopySelectionAsHex();
+            copyAscii.Click += (_, _) => CopySelectionAsAscii();
+            _contextMenu.Items.Add(copyHex);
+            _contextMenu.Items.Add(copyAscii);
+        }
+
+        private void OnRightTapped(object sender, RightTappedRoutedEventArgs e)
+        {
+            bool hasSel = HasSelection();
+            foreach (var item in _contextMenu.Items.OfType<MenuFlyoutItem>())
+                item.IsEnabled = hasSel;
+            _contextMenu.ShowAt(_canvas, e.GetPosition(_canvas));
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  POINTER HANDLING
+        // ═══════════════════════════════════════════════════════════════════
+
+        private bool IsInSbColumn(double x) => x >= _canvas.ActualWidth - ScrollBarWidth;
+
+        private void OnPointerPressed(object sender, PointerRoutedEventArgs e)
+        {
+            var cp = e.GetCurrentPoint(_canvas);
+            if (cp.Properties.IsRightButtonPressed) return;
+            if (IsInSbColumn(cp.Position.X)) return;
+
+            Focus(FocusState.Pointer);
+            _hasFocus = true;
+            System.Diagnostics.Debug.WriteLine("[BHV] OnPointerPressed → Focus(Pointer) called");
+            HideTooltip();
+            _canvas.CapturePointer(e.Pointer);
+            e.Handled = true;
+            _mouseDown = true;
+            long idx = HitTest(cp.Position.X, cp.Position.Y);
+            if (idx >= 0) { _selStart = idx; _selEnd = idx; _caretByte = idx; }
+            else          { _selStart = -1;  _selEnd = -1;  _caretByte = -1; }
+            ScheduleRender(); FireSelectionChanged();
+        }
+
+        private void OnPointerMoved(object sender, PointerRoutedEventArgs e)
+        {
+            if (!_mouseDown) return;
+            var pt = e.GetCurrentPoint(_canvas).Position;
+
+            // ── Auto-scroll when dragging beyond canvas edges ──────────────
+            double contentTop    = _cachedDividerY;
+            double contentBottom = _canvas?.ActualHeight ?? 0;
+            double rowH          = _lineHeight + ExtraLineGap;
+            long   maxTop        = Math.Max(0L, _sbTotalLines - _sbVisibleLines);
+
+            if (pt.Y < contentTop && _topLine > 0)
+            {
+                // Pointer above content area — scroll up proportionally
+                int lines = Math.Max(1, (int)((contentTop - pt.Y) / rowH));
+                _topLine  = Math.Max(0L, _topLine - lines);
+                // Extend selection to first byte of new top line
+                long firstVisible = _topLine * _bytesPerLine;
+                _selEnd = Math.Max(0, firstVisible);
+                _caretByte = _selEnd;
+                ScheduleRender(); FireSelectionChanged();
+                return;
+            }
+
+            if (pt.Y > contentBottom && _topLine < maxTop)
+            {
+                // Pointer below content area — scroll down proportionally
+                int lines = Math.Max(1, (int)((pt.Y - contentBottom) / rowH));
+                _topLine  = Math.Min(maxTop, _topLine + lines);
+                // Extend selection to last byte of last visible line
+                long lastVisible = Math.Min(DataLength - 1,
+                    (_topLine + _sbVisibleLines) * _bytesPerLine - 1);
+                _selEnd = lastVisible;
+                _caretByte = _selEnd;
+                ScheduleRender(); FireSelectionChanged();
+                return;
+            }
+
+            // ── Normal in-bounds move ──────────────────────────────────────
+            long idx = HitTest(pt.X, pt.Y);
+            if (idx >= 0 && idx != _selEnd)
+            {
+                _selEnd = idx; _caretByte = idx;
+                ScheduleRender(); FireSelectionChanged();
+            }
+        }
+
+        private void OnPointerReleased(object sender, PointerRoutedEventArgs e)
+        {
+            _mouseDown = false;
+            _canvas.ReleasePointerCapture(e.Pointer);
+        }
+
+        private void OnPointerHover(object sender, PointerRoutedEventArgs e)
+        {
+            if (_mouseDown) return;
+            var  pt  = e.GetCurrentPoint(_canvas).Position;
+            long idx = HitTest(pt.X, pt.Y, out bool isAsciiColumn);
+
+            // Update hover highlight – only repaint the affected cells, not the whole canvas
+            if (idx != _hoverByte)
+            {
+                long oldHover = _hoverByte;
+                _hoverByte = idx;
+                ScheduleHoverRender(oldHover, idx);
+            }
+
+            FireHoverOffsetChanged(idx, isAsciiColumn);
+
+            if (idx < 0)
+            {
+                HideTooltip();
+                return;
+            }
+
+            // Same byte already showing tooltip → do nothing
+            if (idx == _tooltipByteIdx && _tooltipBorder.Visibility == Visibility.Visible)
+                return;
+
+            // New byte: restart delay timer
+            HideTooltip();
+            _tooltipByteIdx = idx;
+            _tooltipPt      = pt;
+
+            _tooltipTimer = new Microsoft.UI.Xaml.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(500)
+            };
+            _tooltipTimer.Tick += (_, _) =>
+            {
+                _tooltipTimer?.Stop();
+                _tooltipTimer = null;
+                ShowTooltip(_tooltipByteIdx, _tooltipPt);
+            };
+            _tooltipTimer.Start();
+        }
+
+        private void OnPointerExited(object sender, PointerRoutedEventArgs e)
+        {
+            if (_hoverByte != -1)
+            {
+                long oldHover = _hoverByte;
+                _hoverByte = -1;
+                ScheduleHoverRender(oldHover, -1);
+            }
+            FireHoverOffsetChanged(-1, false);
+            HideTooltip();
+        }
+
+        private void ShowTooltip(long idx, Point pt)
+        {
+            if (idx < 0 || idx >= DataLength) return;
+            string label = TooltipOffsetLabel ?? "Offset";
+            string offsetStr = OffsetFormat switch
+            {
+                OffsetFormat.Decimal => $"{label}: {idx} (dec)",
+                OffsetFormat.Octal   => $"{label}: {Convert.ToString(idx, 8).PadLeft(11, '0')} (oct)",
+                _                   => $"{label}: 0x{idx:X8}",
+            };
+            _tooltipText.Text = offsetStr;
+            Microsoft.UI.Xaml.Controls.Canvas.SetLeft(_tooltipBorder, pt.X + 14);
+            Microsoft.UI.Xaml.Controls.Canvas.SetTop (_tooltipBorder, pt.Y - 8);
+            _tooltipBorder.Visibility = Visibility.Visible;
+        }
+
+        private void HideTooltip()
+        {
+            _tooltipTimer?.Stop();
+            _tooltipTimer   = null;
+            _tooltipByteIdx = -1;
+            if (_tooltipBorder != null)
+                _tooltipBorder.Visibility = Visibility.Collapsed;
+        }
+
+        private void OnViewerPointerWheelChanged(object sender, PointerRoutedEventArgs e)
+        {
+
+            var pt = e.GetCurrentPoint(this).Position;
+            if (pt.Y <= _cachedDividerY) return;
+
+            double delta = e.GetCurrentPoint(this).Properties.MouseWheelDelta;
+            _wheelAccum -= delta / 30.0;
+            int whole    = (int)_wheelAccum;
+            _wheelAccum -= whole;
+            if (whole != 0)
+            {
+                long maxTop = Math.Max(0L, _sbTotalLines - _sbVisibleLines);
+                _topLine    = Math.Clamp(_topLine + whole, 0L, maxTop);
+                ScheduleRender();
+            }
+            e.Handled = true;
+        }
+
+        private void OnSbPointerPressed(object sender, PointerRoutedEventArgs e)
+        {
+            if (e.GetCurrentPoint(_canvas).Properties.IsRightButtonPressed) return;
+            var pt = e.GetCurrentPoint(_canvas).Position;
+            if (!IsInSbColumn(pt.X)) return;
+
+            if (pt.Y < _sbBtnUpBottom)
+            {
+                _canvas.CapturePointer(e.Pointer);
+                _sbRepeatDir = -1; _sbRepeatFirst = true;
+                SbRepeatScroll(); StartSbRepeatTimer(400);
+                e.Handled = true; return;
+            }
+            if (pt.Y > _sbBtnDnTop)
+            {
+                _canvas.CapturePointer(e.Pointer);
+                _sbRepeatDir = +1; _sbRepeatFirst = true;
+                SbRepeatScroll(); StartSbRepeatTimer(400);
+                e.Handled = true; return;
+            }
+
+            if (_sbTotalLines <= _sbVisibleLines) return;
+            _canvas.CapturePointer(e.Pointer);
+
+            if (pt.Y >= _sbThumbTop && pt.Y <= _sbThumbBot)
+            {
+                _sbDragging     = true;
+                _sbDragStartY   = pt.Y;
+                _sbDragStartTop = _topLine;
+            }
+            else
+            {
+                double trackTop = _sbBtnUpBottom;
+                double trackH   = Math.Max(1, _sbBtnDnTop - trackTop);
+                double relY     = Math.Max(0, pt.Y - trackTop);
+                long   maxTop   = _sbTotalLines - _sbVisibleLines;
+                _topLine        = Math.Clamp((long)(relY / trackH * _sbTotalLines), 0L, maxTop);
+                _sbDragging     = true;
+                _sbDragStartY   = pt.Y;
+                _sbDragStartTop = _topLine;
+            }
+            ScheduleRender();
+            e.Handled = true;
+        }
+
+        private void OnSbPointerMoved(object sender, PointerRoutedEventArgs e)
+        {
+            if (!_sbDragging) return;
+            var    pt     = e.GetCurrentPoint(_canvas).Position;
+            double trackH = Math.Max(1, _sbBtnDnTop - _sbBtnUpBottom);
+            double dy     = pt.Y - _sbDragStartY;
+            long   maxTop = Math.Max(0L, _sbTotalLines - _sbVisibleLines);
+            _topLine      = Math.Clamp(_sbDragStartTop + (long)(dy * _sbTotalLines / trackH), 0L, maxTop);
+            ScheduleRender();
+            e.Handled = true;
+        }
+
+        private void OnSbPointerReleased(object sender, PointerRoutedEventArgs e)
+        {
+            _sbDragging  = false;
+            _sbRepeatDir = 0;
+            StopSbRepeatTimer();
+            _canvas.ReleasePointerCapture(e.Pointer);
+        }
+
+        private void SbRepeatScroll()
+        {
+            if (_sbRepeatDir == 0) return;
+            long maxTop = Math.Max(0L, _sbTotalLines - _sbVisibleLines);
+            _topLine    = Math.Clamp(_topLine + _sbRepeatDir * _sbVisibleLines, 0L, maxTop);
+            ScheduleRender();
+        }
+
+        private void StartSbRepeatTimer(int initialDelayMs)
+        {
+            StopSbRepeatTimer();
+            _sbRepeatTimer          = new Microsoft.UI.Xaml.DispatcherTimer();
+            _sbRepeatTimer.Interval = TimeSpan.FromMilliseconds(initialDelayMs);
+            _sbRepeatTimer.Tick    += (_, _) =>
+            {
+                if (_sbRepeatDir == 0) { StopSbRepeatTimer(); return; }
+                if (_sbRepeatFirst) { _sbRepeatFirst = false; _sbRepeatTimer!.Interval = TimeSpan.FromMilliseconds(80); }
+                SbRepeatScroll();
+            };
+            _sbRepeatTimer.Start();
+        }
+
+        private void StopSbRepeatTimer()
+        {
+            _sbRepeatTimer?.Stop();
+            _sbRepeatTimer = null;
+        }
+
+        private void ScheduleRender()
+        {
+            if (_renderPending) return;
+            _renderPending = true;
+            // A full render supersedes any pending hover-only render
+            _hoverRenderPending = false;
+            DispatcherQueue.TryEnqueue(
+                Microsoft.UI.Dispatching.DispatcherQueuePriority.High,
+                () =>
+                {
+                    _renderPending = false;
+                    _canvas?.Invalidate();
+                    // Keep the hover overlay in sync after scroll/resize/data changes
+                    _hoverCanvas?.Invalidate();
+                });
+        }
+
+        /// <summary>
+        /// Invalidates only the hover overlay canvas (PART_HoverCanvas) so the main
+        /// canvas — which renders the ruler, bytes and ASCII columns — is never
+        /// touched by a simple mouse-move.  The overlay is transparent everywhere
+        /// except for the 1 px hover border drawn by OnHoverCanvasDraw.
+        /// </summary>
+        private void ScheduleHoverRender(long oldByte, long newByte)
+        {
+            if (_hoverCanvas == null) return;
+            if (_hoverRenderPending) return;
+            _hoverRenderPending = true;
+            DispatcherQueue.TryEnqueue(
+                Microsoft.UI.Dispatching.DispatcherQueuePriority.High,
+                () => { _hoverRenderPending = false; _hoverCanvas?.Invalidate(); });
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  METRICS
+        // ═══════════════════════════════════════════════════════════════════
+
+        private void MeasureFont()
+        {
+            double fs  = FontSize > 0 ? FontSize : 13;
+            // Estimate first so UpdateBytesPerLine has a valid value even before
+            // the canvas device is ready.
+            _charWidth  = fs * 0.601;
+            _lineHeight = fs * 1.35;
+
+            if (_canvas == null) return;
+            try
+            {
+                object? device = null;
+                // Use the format that will actually be used for rendering.
+                // InvalidateTxFormats first so GetFmt picks up any new family.
+                InvalidateTxFormats();
+                using var fmt = new HexTextFormat
+                {
+                    FontFamily   = GetFmt(false).FontFamily,
+                    FontSize     = (float)fs,
+                    FontWeight   = FontWeight,
+                    Wrap = false
+                };
+                // Measure a representative monospaced string: "WW" gives a stable
+                // average even if the font has slight per-glyph width variance.
+                using var layout = new HexTextLayout(device, "WW", fmt, 4096f, 4096f);
+                double measured = layout.LayoutBounds.Width / 2.0;
+                if (measured > 0) _charWidth = measured;
+
+                // Line height: use the font's own ascent+descent+line gap
+                double lineH = layout.LayoutBounds.Height;
+                if (lineH > 0) _lineHeight = lineH;
+            }
+            catch
+            {
+                // Canvas device not yet available — fallback stays in place
+            }
+        }
+
+        private double OffsetColumnWidth() => 15 * _charWidth;
+
+        private void UpdateBytesPerLine()
+        {
+            if (_canvas == null) return;
+
+            if (!FullWidth)
+            {
+                _bytesPerLine = 16;
+                SetBytesPerLine(_bytesPerLine);
+                return;
+            }
+
+            double cw = _canvas.ActualWidth - ScrollBarWidth;
+            if (cw <= 0) cw = ActualWidth - ScrollBarWidth;
+            if (cw <= 0) return;
+
+            double offsetW = OffsetColumnWidth();
+            double gap     = 2 * _charWidth;
+            int    g       = (int)ColumnGroupSize;
+
+            double availW = cw - offsetW - gap - HexExtraGap - gap - AsciiRightPad;
+            if (g > 1) availW -= BytesSpacing;
+
+            double asciiSpacing = _charWidth / 2;
+            double byteAsciiW   = ShowAsciiPanel ? _charWidth + asciiSpacing : 0;
+
+            int newBpl;
+            if (g <= 1)
+            {
+                double byteW = 2 * _charWidth + BytesSpacing + byteAsciiW;
+                newBpl = Math.Max(MinBytesPerLine, (int)((availW + BytesSpacing) / byteW));
+            }
+            else
+            {
+                double groupHexW = GroupWidth(g) + BytesSpacing;
+                double groupAscW = g * byteAsciiW;
+                double groupUnit = groupHexW + groupAscW;
+                int groups = Math.Max(1, (int)((availW + BytesSpacing) / groupUnit));
+                newBpl = groups * g;
+            }
+
+            _bytesPerLine = newBpl;
+            SetBytesPerLine(_bytesPerLine);
+        }
+
+        private void UpdateScrollBar()
+        {
+            _sbTotalLines   = DataLength == 0 || _bytesPerLine == 0
+                              ? 0L
+                              : (DataLength + _bytesPerLine - 1) / _bytesPerLine;
+            _sbVisibleLines = Math.Max(1L, (long)VisibleLineCount());
+            long maxTop     = Math.Max(0L, _sbTotalLines - _sbVisibleLines);
+            if (_topLine > maxTop) _topLine = maxTop;
+        }
+
+        private int VisibleLineCount()
+        {
+            if (_canvas == null) return 1;
+            double h = _canvas.ActualHeight - _cachedDividerY;
+            if (h <= 0) return 1;
+            return Math.Max(1, (int)(h / (_lineHeight + ExtraLineGap)));
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  HIT-TESTING
+        // ═══════════════════════════════════════════════════════════════════
+
+        private long HitTest(double x, double y)
+            => HitTest(x, y, out _);
+
+        private long HitTest(double x, double y, out bool isAsciiColumn)
+        {
+            isAsciiColumn = false;
+            if (DataLength == 0) return -1;
+            double dy = y - _cachedDividerY;
+            if (dy < 0) return -1;
+
+            long row     = (long)(dy / (_lineHeight + ExtraLineGap)) + _topLine;
+            long baseIdx = (long)row * _bytesPerLine;
+            if (baseIdx < 0 || baseIdx >= DataLength) return -1;
+
+            int    g            = (int)ColumnGroupSize;
+            double asciiSpacing = _charWidth / 2;
+
+            double curX = _cachedHexStartX;
+            for (int col = 0; col < _bytesPerLine; col++)
+            {
+                double nextX = curX + HexStep(col, g);
+                if (x >= curX && x < nextX)
+                {
+                    long idx = baseIdx + col;
+                    isAsciiColumn = false;
+                    return idx < DataLength ? idx : -1;
+                }
+                curX = nextX;
+            }
+
+            if (ShowAsciiPanel && x >= _cachedAsciiStartX &&
+                x < _cachedAsciiStartX + _cachedAsciiColWidth)
+            {
+                int col = (int)((x - _cachedAsciiStartX) / (_charWidth + asciiSpacing));
+                if (col >= 0 && col < _bytesPerLine)
+                {
+                    long idx = baseIdx + col;
+                    isAsciiColumn = true;
+                    return idx < DataLength ? idx : -1;
+                }
+            }
+
+            return -1;
+        }
+
+        private void FireHoverOffsetChanged(long offset, bool isAsciiColumn)
+        {
+            if (HoverOffsetChanged == null) return;
+            if (offset == _lastHoverEventOffset && isAsciiColumn == _lastHoverEventIsAscii) return;
+            _lastHoverEventOffset = offset;
+            _lastHoverEventIsAscii = isAsciiColumn;
+            HoverOffsetChanged(this, new HexHoverOffsetChangedEventArgs(offset, isAsciiColumn));
+        }
+
+        private double HexStep(int index, int groupSize)
+        {
+            if (groupSize <= 1)
+                return 2 * _charWidth + BytesSpacing;
+
+            bool isLastInGroup = (index + 1) % groupSize == 0;
+            bool isLastOverall = index == _bytesPerLine - 1;
+
+            double step = 2 * _charWidth + InnerByteGap;
+            if (isLastInGroup && !isLastOverall)
+                step += BytesSpacing;
+
+            return step;
+        }
+
+        private double GroupWidth(int groupSize)
+        {
+            if (groupSize <= 1) return 2 * _charWidth + BytesSpacing;
+            return groupSize * (2 * _charWidth + InnerByteGap) - InnerByteGap;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  RENDERING  –  Skia GPU DrawingSession
+        // ═══════════════════════════════════════════════════════════════════
+
+        private void OnCanvasDraw(HexCanvas sender, HexDrawEventArgs args)
+        {
+            Render(args.DrawingSession);
+        }
+
+        /// <summary>
+        /// Draws the hover highlight on the transparent overlay canvas.
+        /// Because this is a separate HexCanvas, invalidating it never
+        /// triggers a repaint of the main canvas (bytes, ruler, ASCII).
+        /// </summary>
+        private void OnHoverCanvasDraw(HexCanvas sender, HexDrawEventArgs args)
+        {
+            var ds = args.DrawingSession;
+
+            if (_hoverByte < 0 || _hoverByte >= DataLength) return;
+
+            double dividerY = _cachedDividerY;
+            double rowH     = _lineHeight + ExtraLineGap;
+            if (dividerY <= 0 || rowH <= 0 || _bytesPerLine <= 0) return;
+
+            long hoverRow = _hoverByte / _bytesPerLine;
+            int vLines   = VisibleLineCount() + 1;
+            if (hoverRow < _topLine || hoverRow >= _topLine + vLines) return;
+
+            // Derive the same hover colour used by the main Render() pass
+            bool  dark     = IsDark;
+            Color cBg      = BrushColor(Background, dark ? Color.FromArgb(255,30,30,30) : Color.FromArgb(255,254,254,254));
+            Color cRulerFg = RulerForeground is SolidColorBrush rfb
+                             ? rfb.Color
+                             : BlendColor(cBg, (cBg.R * 0.299 + cBg.G * 0.587 + cBg.B * 0.114) < 128 ? Colors.White : Colors.Black, 0.80f);
+            Color cHover   = Color.FromArgb(160, cRulerFg.R, cRulerFg.G, cRulerFg.B);
+
+            var (hx, hy, hw, hh) = HexCellRect(_hoverByte, dividerY, rowH);
+            ds.DrawRectangle((float)hx, (float)hy, (float)hw, (float)hh, cHover, 1f);
+
+            if (ShowAsciiPanel)
+            {
+                var (ax, ay, aw, ah) = AsciiCellRect(_hoverByte, dividerY, rowH);
+                ds.DrawRectangle((float)ax, (float)ay, (float)aw, (float)ah, cHover, 1f);
+            }
+        }
+
+        private HexTextFormat GetFmt(bool bold)
+        {
+            double fs  = FontSize > 0 ? FontSize : 13;
+            string src = FontFamily?.Source ?? "Courier New";
+            string fam = src.Contains(',') ? src.Split(',')[0].Trim() : src;
+            if (string.IsNullOrEmpty(fam)) fam = "Courier New";
+
+            // Respect the FontWeight DP: use Bold if either bold param or FontWeight is Bold
+            bool isBold = bold || FontWeight.Weight >= FontWeights.Bold.Weight;
+
+            if (isBold)
+            {
+                if (_txFmtBold == null)
+                    _txFmtBold = new HexTextFormat
+                    {
+                        FontFamily   = fam,
+                        FontSize     = (float)fs,
+                        FontWeight   = FontWeights.Bold,
+                        Wrap = false
+                    };
+                return _txFmtBold;
+            }
+            if (_txFmt == null)
+                _txFmt = new HexTextFormat
+                {
+                    FontFamily   = fam,
+                    FontSize     = (float)fs,
+                    FontWeight   = FontWeight,
+                    Wrap = false
+                };
+            return _txFmt;
+        }
+
+        private void InvalidateTxFormats()
+        {
+            _txFmt?.Dispose();     _txFmt     = null;
+            _txFmtBold?.Dispose(); _txFmtBold = null;
+        }
+
+        private static void TxCenter(HexDrawingSession ds, string text,
+                                      double x, double y, double cellW, double cellH,
+                                      Color color, HexTextFormat fmt)
+        {
+            using var tl = new HexTextLayout(ds, text, fmt, (float)cellW, (float)cellH);
+            float tx = (float)(x + (cellW  - tl.LayoutBounds.Width)  / 2);
+            float ty = (float)(y + (cellH  - tl.LayoutBounds.Height) / 2);
+            ds.DrawTextLayout(tl, new Vector2(tx, ty), color);
+        }
+
+        private static void TxLeft(HexDrawingSession ds, string text,
+                                    double x, double y, double cellH,
+                                    Color color, HexTextFormat fmt)
+        {
+            using var tl = new HexTextLayout(ds, text, fmt, 4096f, (float)cellH);
+            float ty = (float)(y + (cellH - tl.LayoutBounds.Height) / 2);
+            ds.DrawTextLayout(tl, new Vector2((float)x, ty), color);
+        }
+
+        private static Color BlendColor(Color base_, Color toward, float t)
+        {
+            return Color.FromArgb(255,
+                (byte)(base_.R + (toward.R - base_.R) * t),
+                (byte)(base_.G + (toward.G - base_.G) * t),
+                (byte)(base_.B + (toward.B - base_.B) * t));
+        }
+
+        private static Color BrushColor(Brush? b, Color fallback)
+            => b is SolidColorBrush scb ? scb.Color : fallback;
+
+        /// <summary>
+        /// Returns the pixel rect [x, y, width, height] of a byte cell in the hex area.
+        /// </summary>
+        private (double x, double y, double w, double h) HexCellRect(long byteIdx, double dividerY, double rowH)
+        {
+            long row = byteIdx / _bytesPerLine - _topLine;
+            int col = (int)(byteIdx % _bytesPerLine);
+            int g   = (int)ColumnGroupSize;
+            double y = dividerY + row * rowH;
+            double x = _cachedHexStartX;
+            for (int i = 0; i < col; i++) x += HexStep(i, g);
+            return (x, y, 2 * _charWidth, rowH);
+        }
+
+        /// <summary>
+        /// Returns the pixel rect of a byte cell in the ASCII area.
+        /// </summary>
+        private (double x, double y, double w, double h) AsciiCellRect(long byteIdx, double dividerY, double rowH)
+        {
+            long   row          = byteIdx / _bytesPerLine - _topLine;
+            int    col          = (int)(byteIdx % _bytesPerLine);
+            double asciiSpacing = _charWidth / 2;
+            double y = dividerY + row * rowH;
+            double x = _cachedAsciiStartX + col * (_charWidth + asciiSpacing);
+            return (x, y, _charWidth + asciiSpacing, rowH);
+        }
+
+        private void Render(HexDrawingSession ds)
+        {
+            if (_canvas == null) return;
+            double wf = _canvas.ActualWidth;
+            double w  = wf - ScrollBarWidth;
+            double h  = _canvas.ActualHeight;
+            if (w <= 0 || h <= 0) return;
+
+            var fmt     = GetFmt(bold: false);
+            var fmtBold = GetFmt(bold: true);
+
+            double offsetW      = OffsetColumnWidth();
+            double gap          = 2 * _charWidth;
+            int    g            = (int)ColumnGroupSize;
+            double asciiSpacing = _charWidth / 2;
+            double rowH         = _lineHeight + ExtraLineGap;
+
+            double dividerY  = _lineHeight + RulerExtraHeight + 5;
+            double hexStartX = offsetW + gap + HexExtraGap;
+            _cachedDividerY  = dividerY;
+            _cachedHexStartX = hexStartX;
+
+            double hexWidth = 0;
+            for (int i = 0; i < _bytesPerLine; i++) hexWidth += HexStep(i, g);
+            double asciiStartX   = hexStartX + hexWidth + gap + (g > 1 ? BytesSpacing : 0);
+            _cachedAsciiStartX   = asciiStartX;
+            double asciiColW     = _bytesPerLine * (_charWidth + asciiSpacing) + AsciiRightPad;
+            _cachedAsciiColWidth = asciiColW;
+
+            bool  dark     = IsDark;
+            Color cBg      = BrushColor(Background,          dark ? Color.FromArgb(255,30,30,30)   : Color.FromArgb(255,254,254,254));
+            Color cRulerBg = BlendColor(cBg, dark ? Colors.White : Colors.Black, 0.08f);
+            // Bytes area: explicit Background DP or a very subtle shift from cBg
+            Color cContent = BrushColor(Background,          dark ? Color.FromArgb(255,30,30,30)   : Color.FromArgb(255,254,254,254));
+            Color cDivider = BrushColor(DividerBrush,        dark ? Color.FromArgb(255,80,80,80)   : Color.FromArgb(255,160,160,160));
+            Color cOffset  = BrushColor(OffsetForeground,    dark ? Color.FromArgb(255,100,180,255): Color.FromArgb(255,0,0,139));
+            // RulerForeground: use DP if set, otherwise auto-derive with high contrast from cBg
+            Color cRulerFg = RulerForeground is SolidColorBrush rfb
+                             ? rfb.Color
+                             : BlendColor(cBg, (cBg.R * 0.299 + cBg.G * 0.587 + cBg.B * 0.114) < 128 ? Colors.White : Colors.Black, 0.80f);
+            Color cData    = BrushColor(Foreground,          dark ? Color.FromArgb(255,220,220,220): Colors.Black);
+            Color cSelBg   = BrushColor(SelectionBackground, dark ? Color.FromArgb(255,0,100,200)  : Color.FromArgb(255,0,120,215));
+            Color cSelFg   = BrushColor(SelectionForeground, Colors.White);
+            // OffsetBackground / AsciiBackground: use DP if set, otherwise derive from cBg
+            // — blend toward black on light backgrounds, toward white on dark backgrounds
+            bool  bgIsLight = (cBg.R * 0.299 + cBg.G * 0.587 + cBg.B * 0.114) >= 128;
+            Color cOffsetBg = OffsetBackground is SolidColorBrush obb
+                              ? obb.Color
+                              : BlendColor(cBg, bgIsLight ? Colors.Black : Colors.White, 0.06f);
+            Color cAsciiBg  = AsciiBackground is SolidColorBrush abb
+                              ? abb.Color
+                              : cOffsetBg;
+            // Hover border: semi-transparent version of cRulerFg
+            Color cHover   = Color.FromArgb(160, cRulerFg.R, cRulerFg.G, cRulerFg.B);
+
+            // PASS 1 – backgrounds
+            ds.FillRectangle(0, 0, (float)wf, (float)h, cBg);
+            ds.FillRectangle(0, 0, (float)wf, (float)dividerY, cRulerBg);
+            float contentX = (float)(offsetW + gap / 2);
+            // Offset column band (darker)
+            ds.FillRectangle(0, (float)(dividerY + 1),
+                             contentX, (float)(h - dividerY - 1), cOffsetBg);
+            // Hex bytes area — only up to the start of the ASCII panel (or end of hex if no ASCII)
+            float hexEndX = ShowAsciiPanel
+                ? (float)(asciiStartX - gap / 2)
+                : (float)(hexStartX + hexWidth + gap);
+            if (hexEndX > contentX)
+                ds.FillRectangle(contentX, (float)(dividerY + 1),
+                                 hexEndX - contentX, (float)(h - dividerY - 1), cContent);
+            // ASCII panel band (same as offset by default) — only up to actual content width
+            if (ShowAsciiPanel)
+            {
+                float ascX = (float)(asciiStartX - gap / 2);
+                float ascW = (float)(_cachedAsciiColWidth + gap / 2);
+                if (ascW > 0)
+                    ds.FillRectangle(ascX, (float)(dividerY + 1),
+                                     ascW, (float)(h - dividerY - 1), cAsciiBg);
+            }
+
+            // PASS 2 – selection highlights
+            if (DataLength > 0)
+            {
+                long selS   = Math.Min(_selStart, _selEnd);
+                long selE   = Math.Max(_selStart, _selEnd);
+                bool hasSel = selS >= 0 && selE >= 0;
+                int  vl     = VisibleLineCount() + 1;
+
+                for (int line = 0; line < vl; line++)
+                {
+                    long row    = _topLine + line;
+                    long offset = (long)row * _bytesPerLine;
+                    if (offset >= DataLength) break;
+
+                    double y    = dividerY + line * rowH;
+                    double xHex = hexStartX;
+                    double xAsc = asciiStartX;
+
+                    bool   inHexRun   = false;
+                    double hexRunLeft = 0, lastSelX = 0;
+                    long   lastSelIdx = -1;
+                    double ascLeft = double.MaxValue, ascRight = double.MinValue;
+
+                    for (int i = 0; i < _bytesPerLine; i++)
+                    {
+                        long bi   = offset + i;
+                        if (bi >= DataLength) break;
+                        bool isSel   = hasSel && bi >= selS && bi <= selE;
+                        bool isCaret = bi == _caretByte && !isSel;
+                        double step  = HexStep(i, g);
+
+                        if (isSel)
+                        {
+                            if (!inHexRun)
+                            {
+                                inHexRun   = true;
+                                hexRunLeft = xHex - (bi == selS ? SelPad : 0);
+                            }
+                            lastSelX = xHex; lastSelIdx = bi;
+                            if (ShowAsciiPanel)
+                            {
+                                double al = xAsc - (bi == selS ? SelPad : 0);
+                                double ar = xAsc + _charWidth + asciiSpacing + (bi == selE ? SelPad : 0);
+                                if (al < ascLeft)  ascLeft  = al;
+                                if (ar > ascRight) ascRight = ar;
+                            }
+                        }
+                        else
+                        {
+                            if (inHexRun)
+                            {
+                                double rr = lastSelX + 2 * _charWidth + (lastSelIdx == selE ? SelPad : 0);
+                                ds.FillRectangle((float)hexRunLeft, (float)y,
+                                                 (float)(rr - hexRunLeft), (float)rowH, cSelBg);
+                                inHexRun = false;
+                            }
+                            if (isCaret)
+                                ds.DrawRectangle((float)(xHex - SelPad), (float)y,
+                                                 (float)(2 * _charWidth + SelPad * 2), (float)rowH,
+                                                 BrushColor(SelectionForeground, Colors.Navy));
+                        }
+                        xHex += step;
+                        xAsc += _charWidth + asciiSpacing;
+                    }
+                    if (inHexRun)
+                    {
+                        double rr = lastSelX + 2 * _charWidth + (lastSelIdx == selE ? SelPad : 0);
+                        ds.FillRectangle((float)hexRunLeft, (float)y,
+                                         (float)(rr - hexRunLeft), (float)rowH, cSelBg);
+                    }
+                    if (ShowAsciiPanel && ascLeft < ascRight)
+                        ds.FillRectangle((float)ascLeft, (float)y,
+                                         (float)(ascRight - ascLeft), (float)rowH, cSelBg);
+                }
+            }
+
+            // PASS 3 – divider lines
+            double divX1 = offsetW + gap / 2;
+            ds.DrawLine(0, (float)dividerY, (float)wf, (float)dividerY, cDivider);
+            ds.DrawLine((float)divX1, (float)dividerY, (float)divX1, (float)h, cDivider);
+            if (ShowAsciiPanel)
+            {
+                double divX2 = asciiStartX - gap / 2;
+                ds.DrawLine((float)divX2, (float)dividerY, (float)divX2, (float)h, cDivider);
+                double ascRight2 = asciiStartX + asciiColW;
+                if (ascRight2 <= w)
+                    ds.DrawLine((float)ascRight2, (float)dividerY, (float)ascRight2, (float)h, cDivider);
+            }
+
+            // PASS 4 – ruler labels
+            TxCenter(ds, "OFFSET", 0, 0, offsetW, dividerY, cRulerFg, fmtBold);
+            double rxHex = hexStartX;
+            for (int i = 0; i < _bytesPerLine; i++)
+            {
+                double step = HexStep(i, g);
+                TxCenter(ds, i.ToString("X2"), rxHex, 0,
+                          2 * _charWidth, dividerY, cRulerFg, fmtBold);
+                rxHex += step;
+            }
+            if (ShowAsciiPanel)
+                TxCenter(ds, "ASCII", asciiStartX, 0,
+                          asciiColW, dividerY, cRulerFg, fmtBold);
+
+            if (DataLength == 0)
+            {
+                TxLeft(ds, NoDataLoadedText ?? "No data loaded.", hexStartX, dividerY + 4, _lineHeight, cData, fmt);
+                RenderScrollBar(ds, wf, h);
+                return;
+            }
+
+            // PASS 5 – data rows
+            long sS      = Math.Min(_selStart, _selEnd);
+            long sE      = Math.Max(_selStart, _selEnd);
+            bool hasSelT = sS >= 0 && sE >= 0;
+            int  vLines  = VisibleLineCount() + 1;
+
+            for (int line = 0; line < vLines; line++)
+            {
+                long row     = _topLine + line;
+                long offset2 = (long)row * _bytesPerLine;
+                if (offset2 >= DataLength) break;
+
+                double y2   = dividerY + line * rowH;
+                double xHex = hexStartX;
+                double xAsc = asciiStartX;
+
+                TxCenter(ds, FormatOffset(offset2), 0, y2, offsetW, rowH, cOffset, fmt);
+
+                for (int i = 0; i < _bytesPerLine; i++)
+                {
+                    long bi = offset2 + i;
+                    if (bi >= DataLength) break;
+                    bool   isSel = hasSelT && bi >= sS && bi <= sE;
+                    double step  = HexStep(i, g);
+                    Color  hexFg = isSel ? cSelFg : cData;
+
+                    TxCenter(ds, ByteAt(bi).ToString("X2"), xHex, y2,
+                              2 * _charWidth, rowH, hexFg, fmt);
+
+                    if (ShowAsciiPanel)
+                    {
+                        char  ch = ByteToAsciiChar(ByteAt(bi));
+                        Color fg = isSel ? cSelFg : cData;
+                        TxCenter(ds, ch.ToString(), xAsc, y2,
+                                  _charWidth + asciiSpacing, rowH, fg, fmt);
+                        xAsc += _charWidth + asciiSpacing;
+                    }
+                    xHex += step;
+                }
+            }
+
+            // PASS 6 – hover highlight is now rendered by PART_HoverCanvas (see OnHoverCanvasDraw)
+            // so invalidating the hover overlay never causes the main canvas to repaint.
+
+            RenderScrollBar(ds, wf, h);
+        }
+
+        private void RenderScrollBar(HexDrawingSession ds, double wf, double h)
+        {
+            double sbX    = wf - ScrollBarWidth;
+            double sw     = ScrollBarWidth;
+            bool   canScr = _sbTotalLines > _sbVisibleLines;
+            bool   dark   = IsDark;
+
+            Color trackColor = dark ? Color.FromArgb(255,44,44,44)    : Color.FromArgb(255,240,240,240);
+            Color btnColor   = dark ? Color.FromArgb(255,60,60,60)    : Color.FromArgb(255,225,225,225);
+            Color arrowColor = dark ? Color.FromArgb(255,180,180,180) : Color.FromArgb(255,100,100,100);
+            Color thumbColor = !canScr ? Colors.Transparent
+                             : dark
+                                 ? (_sbDragging ? Color.FromArgb(255,190,190,190) : Color.FromArgb(255,120,120,120))
+                                 : (_sbDragging ? Color.FromArgb(255,90,90,90)    : Color.FromArgb(255,152,152,152));
+
+            double areaTop  = _cachedDividerY + 1;
+            double btnH     = sw;
+            double btnUpTop = areaTop;
+            double btnUpBot = areaTop + btnH;
+            _sbBtnUpBottom  = btnUpBot;
+
+            ds.FillRectangle((float)sbX, (float)btnUpTop, (float)sw, (float)btnH, btnColor);
+            float acx = (float)(sbX + sw / 2), amid = (float)(btnUpTop + btnH / 2);
+            for (int i = 0; i < 4; i++)
+                ds.FillRectangle(acx - (1+i), amid - 2 + i, (1+i)*2, 1, arrowColor);
+
+            double btnDnTop = h - btnH;
+            _sbBtnDnTop     = btnDnTop;
+            ds.FillRectangle((float)sbX, (float)btnDnTop, (float)sw, (float)btnH, btnColor);
+            float dmid = (float)(btnDnTop + btnH / 2);
+            for (int i = 0; i < 4; i++)
+                ds.FillRectangle(acx - (4-i), dmid - 2 + i, (4-i)*2, 1, arrowColor);
+
+            double trackTop = btnUpBot;
+            double trackH   = Math.Max(0, btnDnTop - trackTop);
+            ds.FillRectangle((float)sbX, (float)trackTop, (float)sw, (float)trackH, trackColor);
+
+            if (canScr && trackH > 0)
+            {
+                double thumbH = Math.Min(trackH, Math.Max(20, trackH * _sbVisibleLines / (double)_sbTotalLines));
+                long   maxTop = _sbTotalLines - _sbVisibleLines;
+                double thumbY = trackTop + (trackH - thumbH) * _topLine / (double)maxTop;
+                _sbThumbTop   = thumbY;
+                _sbThumbBot   = thumbY + thumbH;
+                ds.FillRoundedRectangle((float)(sbX+3), (float)thumbY,
+                                        (float)(sw-6), (float)thumbH, 3, 3, thumbColor);
+            }
+            else { _sbThumbTop = _sbThumbBot = 0; }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  THEME
+        // ═══════════════════════════════════════════════════════════════════
+
+        private bool IsDark => ActualTheme == ElementTheme.Dark;
+
+        private void ApplyTheme()
+        {
+            bool dark = IsDark;
+            Background = new SolidColorBrush(dark
+                ? Color.FromArgb(255, 30, 30, 30)   : Color.FromArgb(255, 254, 254, 254));
+            Foreground = new SolidColorBrush(dark
+                ? Color.FromArgb(255,220,220,220)   : Color.FromArgb(255,  27,  27,  27));
+            OffsetForeground = new SolidColorBrush(dark
+                ? Color.FromArgb(255,100,180,255)   : Color.FromArgb(255,   0,   0, 139));
+            DividerBrush = new SolidColorBrush(dark
+                ? Color.FromArgb(255, 80, 80, 80)   : Color.FromArgb(255, 160, 160, 160));
+            SelectionBackground = new SolidColorBrush(dark
+                ? Color.FromArgb(255,  0,100,200)   : Color.FromArgb(255,   0, 120, 215));
+            SelectionForeground = new SolidColorBrush(Colors.White);
+            RulerForeground     = null;   // auto-derive from Background via luminance
+            // Offset and ASCII bands: explicit values for both light and dark
+            OffsetBackground = new SolidColorBrush(dark
+                ? Color.FromArgb(255, 40, 40, 40)   : Color.FromArgb(255, 242, 242, 242));
+            AsciiBackground  = new SolidColorBrush(dark
+                ? Color.FromArgb(255, 40, 40, 40)   : Color.FromArgb(255, 242, 242, 242));
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        //  HELPERS
+        // ═══════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Converts a single byte to its display character using the current
+        /// <see cref="AsciiEncoding"/>. Non-printable / undefined glyphs are
+        /// replaced with '·' (U+00B7) so they are visually distinct from '.'.
+        /// </summary>
+        private char ByteToAsciiChar(byte b)
+        {
+            try
+            {
+                string s = _asciiEncoding.GetString(new[] { b });
+                if (s.Length == 0) return '·';
+                char c = s[0];
+                // Treat control characters and the replacement char as non-printable
+                if (c < 0x20 || c == 0x7F || c == '\uFFFD') return '·';
+                return c;
+            }
+            catch { return '·'; }
+        }
+
+        private string FormatOffset(long offset) => OffsetFormat switch
+        {
+            OffsetFormat.Hexadecimal => $"  {offset:X8}     ",
+            OffsetFormat.Decimal     => $"  {offset,10}   ",
+            OffsetFormat.Octal       => $"  {ToOctal(offset)}  ",
+            _                        => $"  {offset:X8}     "
+        };
+
+        private static string ToOctal(long value)
+        {
+            if (value == 0) return "00000000000";
+            var sb = new System.Text.StringBuilder();
+            ulong v = (ulong)value;
+            while (v > 0) { sb.Insert(0, (char)('0' + (v & 7))); v >>= 3; }
+            while (sb.Length < 11) sb.Insert(0, '0');
+            return sb.ToString();
+        }
+
+        private bool HasSelection() => _selStart >= 0 && _selEnd >= 0 && DataLength > 0;
+
+        private static void SetClipboard(string text)
+        {
+            var pkg = new DataPackage(); pkg.SetText(text); Clipboard.SetContent(pkg);
+        }
+
+        private void FireSelectionChanged()
+        {
+            if (SelectionChanged == null) return;
+            if (_selStart < 0 || _selEnd < 0 || DataLength == 0)
+            {
+                SelectionChanged(this, new HexSelectionChangedEventArgs(-1, 0, Array.Empty<byte>()));
+                return;
+            }
+            long s = Math.Min(_selStart, _selEnd), e = Math.Max(_selStart, _selEnd);
+            long len     = e - s + 1;
+            int  copyLen = (int)Math.Min(len, 5 * 1024 * 1024);
+            var  copy    = new byte[copyLen];
+            if (_bytes != null)
+                Array.Copy(_bytes, s, copy, 0, copyLen);
+            else if (_mmva != null)
+                _mmva.ReadArray(s, copy, 0, copyLen);
+            SelectionChanged(this, new HexSelectionChangedEventArgs(s, len, copy));
+        }
+    }
+}

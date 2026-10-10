@@ -1,0 +1,28 @@
+<Project Sdk="Uno.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <UnoFeatures>SkiaRenderer</UnoFeatures>
+    <RootNamespace>BetterHexViewer.Uno</RootNamespace>
+    <AssemblyName>BetterHexViewer.Uno</AssemblyName>
+    <PackageId>BetterHexViewer.Uno</PackageId>
+    <IsPackable>true</IsPackable>
+    <DefaultItemExcludes>$(DefaultItemExcludes);BetterHexViewer.Uno.Demo/**;artifacts/**</DefaultItemExcludes>
+    <Version>1.2.1</Version>
+    <Authors>zipgenius.it</Authors>
+    <Description>Uno Platform hex viewer with Skia rendering, large-file streaming, selection, search and configurable appearance.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>uno;hex;viewer;control;skia;zipgenius</PackageTags>
+    <PackageProjectUrl>https://github.com/zipgenius/BetterHexView.Uno</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/zipgenius/BetterHexView.Uno</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="BetterHexViewer.Uno.Demo/**" />
+    <Page Remove="BetterHexViewer.Uno.Demo/**" />
+    <Content Remove="BetterHexViewer.Uno.Demo/**" />
+    <EmbeddedResource Remove="BetterHexViewer.Uno.Demo/**" />
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <None Include="LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>
