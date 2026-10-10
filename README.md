@@ -324,38 +324,6 @@ is private, NuGet.org cannot load that URL: host the screenshot at a public URL 
 an allowed domain and update the image link before publication. The screenshot is
 also included in the package under `docs/images/uno-demo.png`.
 
-## Publishing to nuget.org from GitHub
-
-The `BetterHexViewer.Uno NuGet` workflow builds the library and demo, runs integration
-checks and packs the library. Pull requests and manual runs create a downloadable
-artifact. Publication runs after a successful build when a `betterhexviewer-v*` tag
-is pushed or when a manual run explicitly enables the `publish` input.
-
-1. Push the source, workflow, documentation and screenshot to this repository.
-2. Create a nuget.org API key that can publish `BetterHexViewer.Uno`, including
-   permission to create the package for its first release.
-3. Add the key as the GitHub Actions repository secret `NUGET_API_KEY`.
-4. Set `<Version>` in `BetterHexViewer.Uno.csproj` to the version you intend to publish.
-5. Commit the release and push a matching tag, for example for version 1.2.1:
-
-```shell
-git tag betterhexviewer-v1.2.1
-git push origin betterhexviewer-v1.2.1
-```
-
-The tag must point to the release commit and match the project version. Alternatively,
-open **Actions → BetterHexViewer.Uno NuGet → Run workflow**, choose the release branch
-and enable **publish**. Without that input, a manual run only builds, verifies and packs.
-Start a new run after changing the workflow: **Re-run all jobs** uses the original
-workflow revision and inputs.
-
-NuGet package versions are immutable. To deliver this README to consumers in a new
-package, publish an unused version; `--skip-duplicate` skips an existing version
-without updating its documentation. Updating a published package README requires
-a new package version.
-See [NuGet readme guidance](https://learn.microsoft.com/en-us/nuget/nuget-org/package-readme-on-nuget-org)
-and [package publication](https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package).
-
 ## Changelog
 
 See the [Uno Platform changelog](https://github.com/zipgenius/BetterHexView.Uno/blob/master/CHANGELOG.md).
