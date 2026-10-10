@@ -10,40 +10,40 @@
     </Grid.RowDefinitions>
     <Grid ColumnSpacing="8">
       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-      <TextBox x:Name="FilePath" PlaceholderText="Percorso del file"/>
-      <Button Grid.Column="1" Content="Apri file" Click="Open_Click"/>
-      <Button Grid.Column="2" Content="Dati di esempio" Click="Sample_Click"/>
+      <TextBox x:Name="FilePath" PlaceholderText="File path"/>
+      <Button Grid.Column="1" Content="Open file" Click="Open_Click"/>
+      <Button Grid.Column="2" Content="Sample data" Click="Sample_Click"/>
     </Grid>
     <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12">
       <ComboBox x:Name="OffsetMode" Header="Offset" SelectedIndex="0" SelectionChanged="Options_Changed">
         <ComboBoxItem Content="HEX"/><ComboBoxItem Content="DEC"/><ComboBoxItem Content="OCT"/>
       </ComboBox>
-      <ComboBox x:Name="Grouping" Header="Gruppo" SelectedIndex="0" SelectionChanged="Options_Changed">
+      <ComboBox x:Name="Grouping" Header="Group" SelectedIndex="0" SelectionChanged="Options_Changed">
         <ComboBoxItem Content="1"/><ComboBoxItem Content="2"/><ComboBoxItem Content="4"/><ComboBoxItem Content="8"/><ComboBoxItem Content="16"/>
       </ComboBox>
-      <ComboBox x:Name="EncodingMode" Header="Codifica" SelectedIndex="0" SelectionChanged="Options_Changed">
+      <ComboBox x:Name="EncodingMode" Header="Encoding" SelectedIndex="0" SelectionChanged="Options_Changed">
         <ComboBoxItem Content="Latin-1"/><ComboBoxItem Content="IBM 437"/><ComboBoxItem Content="Windows-1252"/><ComboBoxItem Content="UTF-8"/>
       </ComboBox>
-      <ComboBox x:Name="ThemeMode" Header="Tema" SelectedIndex="0" SelectionChanged="Options_Changed">
-        <ComboBoxItem Content="Sistema"/><ComboBoxItem Content="Chiaro"/><ComboBoxItem Content="Scuro"/>
+      <ComboBox x:Name="ThemeMode" Header="Theme" SelectedIndex="0" SelectionChanged="Options_Changed">
+        <ComboBoxItem Content="System"/><ComboBoxItem Content="Light"/><ComboBoxItem Content="Dark"/>
       </ComboBox>
-      <CheckBox x:Name="Fit" Content="Adatta larghezza" VerticalAlignment="Bottom" Click="Options_Click"/>
+      <CheckBox x:Name="Fit" Content="Fit width" VerticalAlignment="Bottom" Click="Options_Click"/>
       <CheckBox x:Name="Ascii" Content="ASCII" IsChecked="True" VerticalAlignment="Bottom" Click="Options_Click"/>
     </StackPanel>
     <StackPanel Grid.Row="2" Orientation="Horizontal" Spacing="8">
-      <TextBox x:Name="Query" Width="200" PlaceholderText="Testo da cercare"/>
-      <Button Content="Cerca" Click="Search_Click"/><Button Content="Successivo" Click="Next_Click"/>
-      <Button Content="Precedente" Click="Previous_Click"/><Button Content="Trova tutti" Click="All_Click"/>
-      <Button Content="Copia HEX" Click="CopyHex_Click"/><Button Content="Copia testo" Click="CopyText_Click"/>
-      <Button Content="Svuota" Click="Clear_Click"/>
+      <TextBox x:Name="Query" Width="200" PlaceholderText="Search text"/>
+      <Button Content="Search" Click="Search_Click"/><Button Content="Next" Click="Next_Click"/>
+      <Button Content="Previous" Click="Previous_Click"/><Button Content="Find all" Click="All_Click"/>
+      <Button Content="Copy HEX" Click="CopyHex_Click"/><Button Content="Copy text" Click="CopyText_Click"/>
+      <Button Content="Clear" Click="Clear_Click"/>
     </StackPanel>
     <Border Grid.Row="3" BorderThickness="1" BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}">
       <hex:BetterHexViewer x:Name="Viewer" SelectionChanged="Viewer_SelectionChanged"
                            HoverOffsetChanged="Viewer_HoverOffsetChanged"
-                           NoDataLoadedText="Nessun dato caricato." TooltipOffsetLabel="Offset"/>
+                           NoDataLoadedText="No data loaded." TooltipOffsetLabel="Offset"/>
     </Border>
     <StackPanel Grid.Row="4" Spacing="4">
-      <TextBlock x:Name="Status" Text="Pronto"/>
+      <TextBlock x:Name="Status" Text="Ready"/>
       <TextBlock x:Name="SelectionStatus"/><TextBlock x:Name="HoverStatus"/>
     </StackPanel>
   </Grid>

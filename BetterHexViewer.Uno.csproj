@@ -6,7 +6,7 @@
     <AssemblyName>BetterHexViewer.Uno</AssemblyName>
     <PackageId>BetterHexViewer.Uno</PackageId>
     <IsPackable>true</IsPackable>
-    <DefaultItemExcludes>$(DefaultItemExcludes);BetterHexViewer.Uno.Demo/**;artifacts/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);BetterHexViewer.Uno.Demo/**;artifacts/**;docs/**</DefaultItemExcludes>
     <Version>1.2.1</Version>
     <Authors>zipgenius.it</Authors>
     <Description>Uno Platform hex viewer with Skia rendering, large-file streaming, selection, search and configurable appearance.</Description>
@@ -21,8 +21,10 @@
     <Compile Remove="BetterHexViewer.Uno.Demo/**" />
     <Page Remove="BetterHexViewer.Uno.Demo/**" />
     <Content Remove="BetterHexViewer.Uno.Demo/**" />
+    <Content Remove="docs/**" />
     <EmbeddedResource Remove="BetterHexViewer.Uno.Demo/**" />
     <None Include="README.md" Pack="true" PackagePath="/" />
     <None Include="LICENSE" Pack="true" PackagePath="/" />
+    <None Include="docs/images/uno-demo.png" Pack="true" PackagePath="docs/images/" />
   </ItemGroup>
 </Project>

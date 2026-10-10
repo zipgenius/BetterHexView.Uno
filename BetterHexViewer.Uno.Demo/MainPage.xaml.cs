@@ -29,18 +29,18 @@ public sealed partial class MainPage : Page
         for (int i = 0; i < data.Length; i++) data[i] = (byte)i;
         Encoding.ASCII.GetBytes("BetterHexViewer.Uno - hello Uno!").CopyTo(data, 0);
         Viewer.LoadBytes(data);
-        Status.Text = $"{Viewer.FileSize:N0} byte caricati";
+        Status.Text = $"{Viewer.FileSize:N0} bytes loaded";
     }
 
     private async Task RunAsync(Func<Task> action)
     {
         try { await action(); }
-        catch (OperationCanceledException) { Status.Text = "Operazione annullata."; }
+        catch (OperationCanceledException) { Status.Text = "Operation cancelled."; }
         catch (Exception ex) { Status.Text = ex.Message; }
     }
 
     private async void Open_Click(object sender, RoutedEventArgs e)
-        => await RunAsync(async () => { await Viewer.OpenFileAsync(FilePath.Text); Status.Text = $"{Viewer.FileSize:N0} byte caricati"; });
+        => await RunAsync(async () => { await Viewer.OpenFileAsync(FilePath.Text); Status.Text = $"{Viewer.FileSize:N0} bytes loaded"; });
     private void Sample_Click(object sender, RoutedEventArgs e) => LoadSample();
     private async void Search_Click(object sender, RoutedEventArgs e)
         => await RunAsync(async () => ShowResult(await Viewer.SearchAsync(Query.Text)));
@@ -49,18 +49,18 @@ public sealed partial class MainPage : Page
     private async void Previous_Click(object sender, RoutedEventArgs e)
         => await RunAsync(async () => ShowResult(await Viewer.SearchPreviousAsync()));
     private async void All_Click(object sender, RoutedEventArgs e)
-        => await RunAsync(async () => Status.Text = $"{(await Viewer.FindAllAsync(Query.Text)).Count:N0} occorrenze");
+        => await RunAsync(async () => Status.Text = $"{(await Viewer.FindAllAsync(Query.Text)).Count:N0} matches");
     private void ShowResult(HexSearchResult result)
-        => Status.Text = result.Found ? $"Trovato a 0x{result.Offset:X} ({result.Length} byte)" : "Nessuna occorrenza";
+        => Status.Text = result.Found ? $"Found at 0x{result.Offset:X} ({result.Length} byte)" : "No match";
     private void CopyHex_Click(object sender, RoutedEventArgs e) => Viewer.CopySelectionAsHex();
     private void CopyText_Click(object sender, RoutedEventArgs e) => Viewer.CopySelectionAsAscii();
-    private void Clear_Click(object sender, RoutedEventArgs e) { Viewer.Clear(); Status.Text = "Nessun dato caricato"; }
+    private void Clear_Click(object sender, RoutedEventArgs e) { Viewer.Clear(); Status.Text = "No data loaded"; }
     private void Viewer_SelectionChanged(object? sender, HexSelectionChangedEventArgs e)
     {
-        if (SelectionStatus != null) SelectionStatus.Text = e.Length > 0 ? $"Selezione: 0x{e.StartOffset:X}, {e.Length:N0} byte" : "Nessuna selezione";
+        if (SelectionStatus != null) SelectionStatus.Text = e.Length > 0 ? $"Selection: 0x{e.StartOffset:X}, {e.Length:N0} byte" : "No selection";
     }
     private void Viewer_HoverOffsetChanged(object? sender, HexHoverOffsetChangedEventArgs e)
-        => HoverStatus.Text = e.Offset < 0 ? "" : $"Puntatore: 0x{e.Offset:X} · {(e.IsAsciiColumn ? "ASCII" : "HEX")}";
+        => HoverStatus.Text = e.Offset < 0 ? "" : $"Pointer: 0x{e.Offset:X} · {(e.IsAsciiColumn ? "ASCII" : "HEX")}";
     private void Options_Changed(object sender, SelectionChangedEventArgs e) => ApplyOptions();
     private void Options_Click(object sender, RoutedEventArgs e) => ApplyOptions();
     private void ApplyOptions()
