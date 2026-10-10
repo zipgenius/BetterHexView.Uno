@@ -1,5 +1,7 @@
 # BetterHexViewer.Uno demo
 
+Demo version: **1.2.2**, matching the `BetterHexViewer.Uno` library release.
+
 This is the **Uno Platform desktop demo**, using the Skia renderer and `net10.0-desktop`.
 It references the Uno control project in this repository; it is independent of the WinUI 3 demo.
 
@@ -38,4 +40,4 @@ Checks include rendering, template loading, focus, search, clipboard, selection,
 empty files, block boundaries, cancellation and a 40 GiB sparse file.
 
 See the [main README](https://github.com/zipgenius/BetterHexView.Uno/blob/master/README.md)
-for the library API, platform requirements and NuGet publication.
+for the library API, platform requirements and NuGet installation.

@@ -1,5 +1,7 @@
 # BetterHexViewer.Uno
 
+Current release: **1.2.2**, for **Uno Platform with the Skia renderer**.
+
 [![NuGet](https://img.shields.io/nuget/v/BetterHexViewer.Uno?logo=nuget)](https://www.nuget.org/packages/BetterHexViewer.Uno)
 [![Build](https://github.com/zipgenius/BetterHexView.Uno/actions/workflows/betterhexviewer-nuget.yml/badge.svg)](https://github.com/zipgenius/BetterHexView.Uno/actions/workflows/betterhexviewer-nuget.yml)
 [![MIT License](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/zipgenius/BetterHexView.Uno/blob/master/LICENSE)
@@ -81,7 +83,7 @@ and [control library guidance](https://platform.uno/docs/articles/guides/how-to-
 ### 1 — Install the NuGet package
 
 ```shell
-dotnet add package BetterHexViewer.Uno
+dotnet add package BetterHexViewer.Uno --version 1.2.2
 ```
 
 ### 2 — Add the XAML namespace

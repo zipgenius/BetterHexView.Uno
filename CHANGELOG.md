@@ -2,12 +2,15 @@
 
 This changelog describes the **Uno Platform edition**, independently of the WinUI 3 package.
 
-## Unreleased
+## 1.2.2 — 2026-10-10
 
 - Replace the Italian package README with English documentation adapted from the WinUI 3 edition.
 - Document Uno Skia host requirements, platform validation, file access, search and selection limits.
 - Add the Uno demo screenshot and English demo labels.
-- Add a dedicated demo README and explain manual NuGet publication.
+- Add a dedicated demo README and align the library and demo versions to 1.2.2.
+- Include the English README and demo screenshot in the NuGet package.
+- Remove release publication instructions from the package README.
+- Allow explicit manual publication through the workflow's `publish` input.
 
 ## 1.2.1 — Uno Platform port
 

@@ -7,7 +7,7 @@
     <PackageId>BetterHexViewer.Uno</PackageId>
     <IsPackable>true</IsPackable>
     <DefaultItemExcludes>$(DefaultItemExcludes);BetterHexViewer.Uno.Demo/**;artifacts/**;docs/**</DefaultItemExcludes>
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <Authors>zipgenius.it</Authors>
     <Description>Uno Platform hex viewer with Skia rendering, large-file streaming, selection, search and configurable appearance.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
