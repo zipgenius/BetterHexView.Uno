@@ -2,6 +2,12 @@ name: BetterHexViewer.Uno NuGet
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish the package to nuget.org after a successful build'
+        type: boolean
+        required: false
+        default: false
   push:
     tags:
       - 'betterhexviewer-v*'
@@ -63,7 +69,9 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/betterhexviewer-v')
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/betterhexviewer-v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 5

@@ -163,9 +163,9 @@ Riferimenti: [librerie di controlli Uno](https://platform.uno/docs/articles/guid
 
 Il workflow `.github/workflows/betterhexviewer-nuget.yml` compila libreria e demo,
 esegue le verifiche di integrazione e crea il pacchetto della sola libreria.
-Push di codice, pull request e
-avvio manuale del workflow producono un artefatto scaricabile; la pubblicazione
-su nuget.org avviene soltanto al push di un tag `betterhexviewer-v*`.
+Le pull request e l'avvio manuale del workflow producono un artefatto scaricabile.
+La pubblicazione su nuget.org avviene al push di un tag `betterhexviewer-v*`
+oppure all'avvio manuale con l'opzione `publish` selezionata.
 
 1. Caricare i sorgenti e il workflow nel repository GitHub.
 2. Creare su nuget.org una API key con permessi di pubblicazione per
@@ -182,6 +182,12 @@ git push origin betterhexviewer-v1.2.1
 
 Il tag deve puntare al commit contenente il workflow e i sorgenti della release.
 Il workflow rifiuta tag la cui versione non coincide con quella del progetto.
+Per pubblicare manualmente, aprire **Actions → BetterHexViewer.Uno NuGet → Run workflow**,
+scegliere il branch da pubblicare e selezionare l'opzione `publish`.
+Senza questa opzione il workflow esegue solo build, verifiche e creazione del pacchetto.
+La pubblicazione richiede una build riuscita e il secret `NUGET_API_KEY`.
+Dopo aver aggiornato il workflow su GitHub, avviare una nuova esecuzione:
+**Re-run all jobs** su una vecchia esecuzione usa il workflow e gli input originali.
 Per le release successive cambiare `<Version>`, fare commit e usare il nuovo tag.
 NuGet non consente di sostituire una versione pubblicata; `--skip-duplicate`
 consente di rieseguire il workflow senza tentare di sovrascriverla.
